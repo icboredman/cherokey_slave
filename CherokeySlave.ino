@@ -5,6 +5,9 @@
  * 
  * boredman@boredomprojects.net
  * 
+ * rev 2.0 - 2016.07.10
+ *    - communication over UART (instead of I2C)
+ *    
  * rev 1.0 - 2016.05.18
  *    - initial version
  * uses
@@ -12,11 +15,11 @@
  * ---------------------------------------------------
  */
 
-#include <Wire.h>
+//#include <Wire.h>
 
 //#define DEBUG
 
-#define I2C_SLAVE_ADDR  0x42
+//#define I2C_SLAVE_ADDR  0x42
 
 const int anlgPin_VBat = 0;
 const int anlgPin_IBat = 1;
@@ -30,7 +33,7 @@ const int digPin_SHD = 2;
 class cRobot 
 {
   public:
-  enum eI2Command {
+  enum eCommand {
     CMD_SETLED = 1,
     CMD_STATUS = 2,
     CMD_SETSHD = 3
@@ -50,7 +53,7 @@ class cRobot
 } robot;
 
 
-byte i2cmd[10];
+//byte i2cmd[10];
 byte led_config;
 
 /*******************************************************
@@ -58,9 +61,9 @@ byte led_config;
  *******************************************************/
 void setup() 
 {
-  Wire.begin(I2C_SLAVE_ADDR);       // join i2c bus as slave
-  Wire.onRequest(i2cRequestEvent);  // register event
-  Wire.onReceive(i2cReceiveEvent); // register event
+//  Wire.begin(I2C_SLAVE_ADDR);       // join i2c bus as slave
+//  Wire.onRequest(i2cRequestEvent);  // register event
+//  Wire.onReceive(i2cReceiveEvent); // register event
 
   pinMode(digPin_LED, OUTPUT);
   led_config = 0x5A;
@@ -68,9 +71,7 @@ void setup()
   pinMode(digPin_SHD, OUTPUT);
   digitalWrite(digPin_SHD, LOW);
 
-#ifdef DEBUG
-  Serial.begin(57600);
-#endif
+  Serial.begin(115200);
 }
 
 
@@ -94,8 +95,40 @@ void loop()
 
   UpdateLED();
 
-#ifdef DEBUG
-//  delay(100);
+  if( Serial.available() )
+  {
+    byte cmd = Serial.read();
+    switch( cmd )
+    {
+      case cRobot::CMD_SETLED :
+          if( Serial.available() )
+          {
+            led_config = Serial.read();
+            Serial.write(0);  // success
+          }
+          else
+            Serial.write(-1); // error
+          break;
+      case cRobot::CMD_STATUS :
+          Serial.write((byte*)&(robot.data), sizeof(robot.data)); 
+          break;
+      case cRobot::CMD_SETSHD:
+          if( Serial.available() )
+          {
+            digitalWrite(digPin_SHD, Serial.read());
+            Serial.write(0);  // success
+          }
+          else
+            Serial.write(-1); // error
+          break;
+      default :
+          break;
+    }
+  }
+
+
+
+/*
   static long timer;
   if( (millis() - timer) > 1000 )
   { 
@@ -105,7 +138,7 @@ void loop()
     Serial.print(state_cnt); Serial.print(" ");
     Serial.println(state);
   }
-#endif
+*/
 }
 
 
@@ -118,12 +151,14 @@ void loop()
  *   [1] - command to be executed
  *   [2]..[n] - any additional parameters
  *******************************************************/
+/*
 void i2cReceiveEvent(int howMany) 
 {
   i2cmd[0] = howMany;
   for(int i=1; i<howMany+1 && i<sizeof(i2cmd); i++)
     i2cmd[i] = Wire.read();
 }
+*/
 
 
 /*******************************************************
@@ -132,6 +167,7 @@ void i2cReceiveEvent(int howMany)
  *  gets called whenever data is requested by master
  *  executes command previously received with i2cReceiveEvent()
  *******************************************************/
+/*
 void i2cRequestEvent() 
 {
   switch(i2cmd[1])
@@ -161,7 +197,7 @@ void i2cRequestEvent()
         break;
   }
 }
-
+*/
 
 #define min_pulse_ms 100
 
