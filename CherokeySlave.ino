@@ -5,6 +5,11 @@
  * 
  * boredman@boredomprojects.net
  * 
+ * rev 2.1 - 2016.07.11
+ *    - implemented packet-based uart communication
+ *      using RH_Serial driver from RadioHead:
+ *      http://www.airspayce.com/mikem/arduino/RadioHead/classRH__Serial.html
+ *    
  * rev 2.0 - 2016.07.10
  *    - communication over UART (instead of I2C)
  *    
@@ -15,11 +20,11 @@
  * ---------------------------------------------------
  */
 
-//#include <Wire.h>
+#include <RH_Serial.h>
 
-//#define DEBUG
+// instance of serial driver
+RH_Serial uart(Serial);
 
-//#define I2C_SLAVE_ADDR  0x42
 
 const int anlgPin_VBat = 0;
 const int anlgPin_IBat = 1;
@@ -28,7 +33,14 @@ const int anlgPin_Vs   = 3;
 const int digPin_LED = 13;
 const int digPin_SHD = 2;
 
+// motor drive pins
+const int pin_motor_pwm_right = 11;  // M1-PWM
+const int pin_motor_dir_right =  9;  // M1-DIR
+const int pin_motor_pwm_left  = 10;  // M2-PWM
+const int pin_motor_dir_left  =  8;  // M2-DIR
+
 #define VCC (5.0f)
+
 
 class cRobot 
 {
@@ -36,7 +48,8 @@ class cRobot
   enum eCommand {
     CMD_SETLED = 1,
     CMD_STATUS = 2,
-    CMD_SETSHD = 3
+    CMD_SETSHD = 3,
+    CMD_DRIVE  = 4
   };
   enum eChargerState {
     CHGR_OFF = 10,
@@ -49,11 +62,14 @@ class cRobot
     int16_t  battery_miA;
     uint16_t vsupply_miV;
     uint16_t charger_state;
-  } data;
+  } power;
+  struct {
+    int16_t speed;
+    int16_t turn;
+  } drive;
 } robot;
 
 
-//byte i2cmd[10];
 byte led_config;
 
 /*******************************************************
@@ -61,9 +77,6 @@ byte led_config;
  *******************************************************/
 void setup() 
 {
-//  Wire.begin(I2C_SLAVE_ADDR);       // join i2c bus as slave
-//  Wire.onRequest(i2cRequestEvent);  // register event
-//  Wire.onReceive(i2cReceiveEvent); // register event
 
   pinMode(digPin_LED, OUTPUT);
   led_config = 0x5A;
@@ -71,7 +84,22 @@ void setup()
   pinMode(digPin_SHD, OUTPUT);
   digitalWrite(digPin_SHD, LOW);
 
+  pinMode(pin_motor_pwm_right, OUTPUT);
+  digitalWrite(pin_motor_pwm_right, LOW);
+  pinMode(pin_motor_dir_right, OUTPUT);
+  digitalWrite(pin_motor_dir_right, LOW);
+  pinMode(pin_motor_pwm_left, OUTPUT);
+  digitalWrite(pin_motor_pwm_left, LOW);
+  pinMode(pin_motor_dir_left, OUTPUT);
+  digitalWrite(pin_motor_dir_left, LOW);
+
+  robot.drive.speed = 0;
+  robot.drive.turn = 0;
+  
   Serial.begin(115200);
+  uart.serial().begin(115200);
+  if( ! uart.init() )
+    while(1);
 }
 
 
@@ -87,58 +115,44 @@ void loop()
   int vs_miV = analogReadAvg(anlgPin_Vs, 100) * (39+39+4.7)/4.7 * VCC;
 
   noInterrupts();
-  robot.data.battery_miV = bat_miV;
-  robot.data.battery_miA = bat_miA;
-  robot.data.vsupply_miV = vs_miV;
-  robot.data.charger_state = state;
+  robot.power.battery_miV = bat_miV;
+  robot.power.battery_miA = bat_miA;
+  robot.power.vsupply_miV = vs_miV;
+  robot.power.charger_state = state;
   interrupts();
 
   UpdateLED();
 
-  if( Serial.available() )
+  UpdateDrive();
+
+  uint8_t buffer[100];
+  uint8_t len;
+  
+  if( uart.recv(buffer, &len) )
   {
-    byte cmd = Serial.read();
-    switch( cmd )
+    switch( buffer[0] )
     {
       case cRobot::CMD_SETLED :
-          if( Serial.available() )
-          {
-            led_config = Serial.read();
-            Serial.write(0);  // success
-          }
-          else
-            Serial.write(-1); // error
+          if( len == 2 )
+            led_config = buffer[1];
           break;
       case cRobot::CMD_STATUS :
-          Serial.write((byte*)&(robot.data), sizeof(robot.data)); 
+          if( len == 1 )
+            uart.send((uint8_t*)&(robot.power), sizeof(robot.power));
           break;
-      case cRobot::CMD_SETSHD:
-          if( Serial.available() )
-          {
-            digitalWrite(digPin_SHD, Serial.read());
-            Serial.write(0);  // success
-          }
-          else
-            Serial.write(-1); // error
+      case cRobot::CMD_SETSHD :
+          if( len == 2 )
+            digitalWrite(digPin_SHD, buffer[1]);
+          break;
+      case cRobot::CMD_DRIVE  :
+          if( len == 1 + sizeof(robot.drive) )
+            memcpy(&(robot.drive), &buffer[1], sizeof(robot.drive));
           break;
       default :
           break;
     }
   }
 
-
-
-/*
-  static long timer;
-  if( (millis() - timer) > 1000 )
-  { 
-    timer = millis();
-    Serial.print(bat_miV/1024.0); Serial.print(" ");
-    Serial.print(bat_miA/1024.0); Serial.print("   ");
-    Serial.print(state_cnt); Serial.print(" ");
-    Serial.println(state);
-  }
-*/
 }
 
 
@@ -199,6 +213,48 @@ void i2cRequestEvent()
 }
 */
 
+#define pwm_min 300
+
+/*******************************************************
+ *
+ *******************************************************/
+void UpdateDrive(void)
+{
+  int16_t pwm_right, pwm_left;
+  int8_t  dir_right, dir_left;
+
+  pwm_right  = robot.drive.speed + robot.drive.turn;
+  if( pwm_right < 0 )
+  {
+    pwm_right = -pwm_right + pwm_min;
+    dir_right = HIGH;
+  }
+  else if( pwm_right > 0 )
+  {
+    pwm_right = pwm_right + pwm_min;
+    dir_right = LOW;
+  }
+  
+  pwm_left  = robot.drive.speed - robot.drive.turn;
+  if( pwm_left < 0 )
+  {
+    pwm_left = -pwm_left + pwm_min;
+    dir_left = HIGH;
+  }
+  else if( pwm_left > 0 )
+  {
+    pwm_left = pwm_left + pwm_min;
+    dir_left = LOW;
+  }
+
+  analogWrite(pin_motor_pwm_right, highByte(pwm_right));
+  analogWrite(pin_motor_pwm_left, highByte(pwm_left));
+  digitalWrite(pin_motor_dir_right, dir_right);
+  digitalWrite(pin_motor_dir_left, dir_left);
+}
+
+
+
 #define min_pulse_ms 100
 
 /*******************************************************
@@ -248,10 +304,10 @@ void UpdateLED(void)
 unsigned long voltage2millis(void)
 {
   // lowest battery level is 0.9V per cell
-  if( robot.data.battery_miV <= (uint16_t)(6 * 0.9 * 1024) )
+  if( robot.power.battery_miV <= (uint16_t)(6 * 0.9 * 1024) )
     return min_pulse_ms; // alarm!
   else
-    return (robot.data.battery_miV - (uint16_t)(6 * 0.9 * 1024)) * 2 + min_pulse_ms;
+    return (robot.power.battery_miV - (uint16_t)(6 * 0.9 * 1024)) * 2 + min_pulse_ms;
 }
 
 
