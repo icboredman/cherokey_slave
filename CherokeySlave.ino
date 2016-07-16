@@ -5,6 +5,9 @@
  * 
  * boredman@boredomprojects.net
  * 
+ * rev 2.3 - 2016.07.16
+ *    - put back LED battery indicator
+ *
  * rev 2.2 - 2016.07.16
  *    - adapted for use with ROS through 'rosserial' package
  *    - implemented messages:
@@ -70,7 +73,6 @@ void callback_cmd_vel(const geometry_msgs::Twist& cmd_vel)
   pwm_speed = (int)(cmd_vel.linear.x * 255 / top_speed_m_s);
   // 1 rad/s at stand still corresponds to +/-(distance between wheels / 2)
   pwm_turn  = (int)(cmd_vel.angular.z * turn_radius_m * 255 / top_speed_m_s);
-
   got_new_vel = true;
 }
 
@@ -82,16 +84,12 @@ BatteryState bat_msg;
 ros::Publisher pub_bat("cherokey/battery", &bat_msg);
 
 
-
-byte led_config;
-
 /*******************************************************
  * SETUP function runs once on power-up or reset
  *******************************************************/
 void setup() 
 {
   pinMode(digPin_LED, OUTPUT);
-  led_config = 0x5A;
 
   pinMode(digPin_SHD, OUTPUT);
   digitalWrite(digPin_SHD, LOW);
@@ -145,9 +143,8 @@ void loop()
     bat_msg.charge = vs_miV / 1024.0; // use for VS
     bat_msg.power_supply_status = ChargingState(state_adc);
     bat_msg.percentage = BatteryPercentage(bat_msg.voltage);
-
+    
     pub_bat.publish(&bat_msg);
-    //digitalWrite(digPin_LED, HIGH-digitalRead(digPin_LED));   // toggle led
   }
 
   nh.spinOnce();
@@ -157,15 +154,18 @@ void loop()
     UpdateDrive();
     got_new_vel = false;
   }
+
+  UpdateLED(bat_msg.percentage);
 }
 
 
 
-#define pwm_min 10
-
 /*******************************************************
- *
+ * UpdateDrive()
+ *   uses global variables pwm_speed and pwm_turn
+ *   to calculate and set PWM values that drive motors.
  *******************************************************/
+#define pwm_min 10
 void UpdateDrive(void)
 {
   int16_t pwm_right, pwm_left;
@@ -206,65 +206,10 @@ void UpdateDrive(void)
 }
 
 
-
 /*******************************************************
- * UpdateLED()
- *  controls state of LED - indicator of battery voltage
- *  according to global variable led_config:
- *    0    - LED always OFF
- *    0xFF - LED always ON
- *    0x5A - LED pulsed according to battery voltage.
- *           rate of pulsation is determined by function
- *           voltage2millis()
- *******************************************************/
-/*
-void UpdateLED(void)
-{
-  static byte state;
-  static unsigned long last_time;
-
-  if( led_config == 0x5A )
-  {
-    if( state == LOW && (millis() - last_time) > voltage2millis() )
-    {
-      digitalWrite(digPin_LED, HIGH);
-      state = HIGH;
-      last_time = millis();
-    }
-    else if( state == HIGH && (millis() - last_time) > min_pulse_ms )
-    {
-      digitalWrite(digPin_LED, LOW);
-      state = LOW;
-      last_time = millis();
-    }
-  }
-  else
-  {
-    digitalWrite(digPin_LED, state = led_config ? HIGH : LOW);
-  }
-
-}
-*/
-
-/*******************************************************
- * voltage2millis()
- *  calculates the duration of pulses for battery voltage
- *  indicator LED.
- *  lower the voltage -> shorter the duration.
- *******************************************************/
-/*
-unsigned long voltage2millis(void)
-{
-  // lowest battery level is 0.9V per cell
-  if( robot.power.battery_miV <= (uint16_t)(6 * 0.9 * 1024) )
-    return min_pulse_ms; // alarm!
-  else
-    return (robot.power.battery_miV - (uint16_t)(6 * 0.9 * 1024)) * 2 + min_pulse_ms;
-}
-*/
-
-/*******************************************************
- * 
+ * BatteryPercentage()
+ *   calculates remaining battery charge 
+ *   as a value between 0.0 and 1.0
  *******************************************************/
 float BatteryPercentage(float vbat)
 {
@@ -275,6 +220,34 @@ float BatteryPercentage(float vbat)
     return 1.0;
   else
     return percentage;
+}
+
+
+/*******************************************************
+ * UpdateLED()
+ *  controls state of LED - indicator of battery voltage
+ *  according to percentage:
+ *  - LED pulsed according to battery voltage.
+ *    rate of pulsation is determined by function voltage2millis()
+ *******************************************************/
+void UpdateLED(float percentage)
+{
+  static byte state;
+  static unsigned long last_time;
+
+  if( state == LOW && (millis() - last_time) > (100 + percentage * 5000.0) )
+  {
+    digitalWrite(digPin_LED, HIGH);
+    state = HIGH;
+    last_time = millis();
+  }
+  else if( state == HIGH && (millis() - last_time) > 100 )
+  {
+    digitalWrite(digPin_LED, LOW);
+    state = LOW;
+    last_time = millis();
+  }
+
 }
 
 
