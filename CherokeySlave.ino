@@ -5,6 +5,12 @@
  * 
  * boredman@boredomprojects.net
  * 
+ * rev 2.2 - 2016.07.16
+ *    - adapted for use with ROS through 'rosserial' package
+ *    - implemented messages:
+ *        geometry_msgs/Twist (cmd_vel)
+ *        sensor_msgs/BatteryState
+ *    
  * rev 2.1 - 2016.07.11
  *    - implemented packet-based uart communication
  *      using RH_Serial driver from RadioHead:
@@ -20,54 +26,61 @@
  * ---------------------------------------------------
  */
 
-#include <RH_Serial.h>
+#include <ros.h>
+#include <geometry_msgs/Twist.h>
+#include <sensor_msgs/BatteryState.h>
 
-// instance of serial driver
-RH_Serial uart(Serial);
+using namespace sensor_msgs;
 
+const int digPin_LED = 13;
+const int digPin_SHD = 2;
 
+// power supply pins
 const int anlgPin_VBat = 0;
 const int anlgPin_IBat = 1;
 const int anlgPin_Stat = 2;
 const int anlgPin_Vs   = 3;
-const int digPin_LED = 13;
-const int digPin_SHD = 2;
 
-// motor drive pins
-const int pin_motor_pwm_right = 11;  // M1-PWM
-const int pin_motor_dir_right =  9;  // M1-DIR
+// motor drive pins (PWM must be on pins 9 and 10)
+const int pin_motor_pwm_right =  9;  // M1-PWM
+const int pin_motor_dir_right = 11;  // M1-DIR
 const int pin_motor_pwm_left  = 10;  // M2-PWM
 const int pin_motor_dir_left  =  8;  // M2-DIR
 
 #define VCC (5.0f)
 
+#define BAT_N_CELLS    6
+#define BAT_CELL_VMAX  1.4
+#define BAT_CELL_VMIN  0.9
 
-class cRobot 
+// linear speed in [m/s] corresponding to max pwm
+#define top_speed_m_s  0.7
+// half the distance between wheels in [m]
+#define turn_radius_m  0.072
+
+// velocity vector in units of [pwm counts]
+int pwm_speed = 0;
+int pwm_turn = 0;
+
+bool got_new_vel = false;
+
+void callback_cmd_vel(const geometry_msgs::Twist& cmd_vel)
 {
-  public:
-  enum eCommand {
-    CMD_SETLED = 1,
-    CMD_STATUS = 2,
-    CMD_SETSHD = 3,
-    CMD_DRIVE  = 4
-  };
-  enum eChargerState {
-    CHGR_OFF = 10,
-    CHGR_INIT = 11,
-    CHGR_CHARGE = 12,
-    CHGR_TRICKLE = 13,
-  };
-  struct {
-    uint16_t battery_miV;
-    int16_t  battery_miA;
-    uint16_t vsupply_miV;
-    uint16_t charger_state;
-  } power;
-  struct {
-    int16_t speed;
-    int16_t turn;
-  } drive;
-} robot;
+  // top_speed in m/s corresponds to pwm count of 255
+  pwm_speed = (int)(cmd_vel.linear.x * 255 / top_speed_m_s);
+  // 1 rad/s at stand still corresponds to +/-(distance between wheels / 2)
+  pwm_turn  = (int)(cmd_vel.angular.z * turn_radius_m * 255 / top_speed_m_s);
+
+  got_new_vel = true;
+}
+
+ros::NodeHandle nh;
+
+ros::Subscriber<geometry_msgs::Twist> sub_vel("cherokey/cmd_vel", &callback_cmd_vel );
+
+BatteryState bat_msg;
+ros::Publisher pub_bat("cherokey/battery", &bat_msg);
+
 
 
 byte led_config;
@@ -77,12 +90,21 @@ byte led_config;
  *******************************************************/
 void setup() 
 {
-
   pinMode(digPin_LED, OUTPUT);
   led_config = 0x5A;
 
   pinMode(digPin_SHD, OUTPUT);
   digitalWrite(digPin_SHD, LOW);
+
+  // populate some constant values
+  bat_msg.design_capacity = 2500.0;
+  bat_msg.power_supply_technology = BatteryState::POWER_SUPPLY_TECHNOLOGY_NIMH;
+  bat_msg.present = true;
+
+  nh.getHardware()->setBaud(115200);
+  nh.initNode();
+  nh.advertise(pub_bat);
+  nh.subscribe(sub_vel);
 
   pinMode(pin_motor_pwm_right, OUTPUT);
   digitalWrite(pin_motor_pwm_right, LOW);
@@ -93,13 +115,12 @@ void setup()
   pinMode(pin_motor_dir_left, OUTPUT);
   digitalWrite(pin_motor_dir_left, LOW);
 
-  robot.drive.speed = 0;
-  robot.drive.turn = 0;
-  
-  Serial.begin(115200);
-  uart.serial().begin(115200);
-  if( ! uart.init() )
-    while(1);
+  // Reduce PWM frequency for timer1 (pins 9 and 10) to about 30 Hz,
+  // to prevent buzzing sounds from motors.
+  // This should not cause interference to delay() amd millis(),
+  // as those functions use timer0 and timer2.
+  // (http://playground.arduino.cc/Code/PwmFrequency)
+  TCCR1B = TCCR1B & 0b11111000 | 0x05;  // about 30 Hz
 }
 
 
@@ -108,112 +129,39 @@ void setup()
  *******************************************************/
 void loop() 
 {
-  int bat_miV, bat_miA;
-  BatteryVIavg(&bat_miV, &bat_miA, anlgPin_VBat, anlgPin_IBat, 100);
-  int state_cnt = analogReadAvg(anlgPin_Stat, 100);
-  byte state = ChargingState(state_cnt);
-  int vs_miV = analogReadAvg(anlgPin_Vs, 100) * (39+39+4.7)/4.7 * VCC;
-
-  noInterrupts();
-  robot.power.battery_miV = bat_miV;
-  robot.power.battery_miA = bat_miA;
-  robot.power.vsupply_miV = vs_miV;
-  robot.power.charger_state = state;
-  interrupts();
-
-  UpdateLED();
-
-  UpdateDrive();
-
-  uint8_t buffer[100];
-  uint8_t len;
-  
-  if( uart.recv(buffer, &len) )
+  static unsigned long time_prev;
+  unsigned long time_now = millis();
+  if( time_now - time_prev > 1000 )
   {
-    switch( buffer[0] )
-    {
-      case cRobot::CMD_SETLED :
-          if( len == 2 )
-            led_config = buffer[1];
-          break;
-      case cRobot::CMD_STATUS :
-          if( len == 1 )
-            uart.send((uint8_t*)&(robot.power), sizeof(robot.power));
-          break;
-      case cRobot::CMD_SETSHD :
-          if( len == 2 )
-            digitalWrite(digPin_SHD, buffer[1]);
-          break;
-      case cRobot::CMD_DRIVE  :
-          if( len == 1 + sizeof(robot.drive) )
-            memcpy(&(robot.drive), &buffer[1], sizeof(robot.drive));
-          break;
-      default :
-          break;
-    }
+    time_prev = time_now;
+    
+    int bat_miV, bat_miA;
+    BatteryVIavg(&bat_miV, &bat_miA, anlgPin_VBat, anlgPin_IBat, 100);
+    int vs_miV = analogReadAvg(anlgPin_Vs, 100) * (39+39+4.7)/4.7 * VCC;
+    int state_adc = analogReadAvg(anlgPin_Stat, 100);
+
+    bat_msg.voltage = bat_miV / 1024.0;
+    bat_msg.current = bat_miA / 1024.0;
+    bat_msg.charge = vs_miV / 1024.0; // use for VS
+    bat_msg.power_supply_status = ChargingState(state_adc);
+    bat_msg.percentage = BatteryPercentage(bat_msg.voltage);
+
+    pub_bat.publish(&bat_msg);
+    //digitalWrite(digPin_LED, HIGH-digitalRead(digPin_LED));   // toggle led
   }
 
-}
+  nh.spinOnce();
 
-
-/*******************************************************
- * i2cReceiveEvent()
- *  this function is registered as an event
- *  gets called whenever data is received from master
- * array i2cmd[] will be filled with received data:
- *   [0] - total number of bytes received
- *   [1] - command to be executed
- *   [2]..[n] - any additional parameters
- *******************************************************/
-/*
-void i2cReceiveEvent(int howMany) 
-{
-  i2cmd[0] = howMany;
-  for(int i=1; i<howMany+1 && i<sizeof(i2cmd); i++)
-    i2cmd[i] = Wire.read();
-}
-*/
-
-
-/*******************************************************
- * i2cRequestEvent()
- *  this function is registered as an event
- *  gets called whenever data is requested by master
- *  executes command previously received with i2cReceiveEvent()
- *******************************************************/
-/*
-void i2cRequestEvent() 
-{
-  switch(i2cmd[1])
+  if( got_new_vel )
   {
-    case cRobot::CMD_SETLED :
-        if(i2cmd[0] == 2)
-        {
-          led_config = i2cmd[2];
-          Wire.write(0);  // success
-        }
-        else
-          Wire.write(-1); // error
-        break;
-    case cRobot::CMD_STATUS :
-        Wire.write((byte*)&(robot.data), sizeof(robot.data)); 
-        break;
-    case cRobot::CMD_SETSHD:
-        if(i2cmd[0] == 2)
-        {
-          digitalWrite(digPin_SHD, i2cmd[2]);
-          Wire.write(0);  // success
-        }
-        else
-          Wire.write(-1); // error
-        break;
-    default :
-        break;
+    UpdateDrive();
+    got_new_vel = false;
   }
 }
-*/
 
-#define pwm_min 300
+
+
+#define pwm_min 10
 
 /*******************************************************
  *
@@ -223,39 +171,41 @@ void UpdateDrive(void)
   int16_t pwm_right, pwm_left;
   int8_t  dir_right, dir_left;
 
-  pwm_right  = robot.drive.speed + robot.drive.turn;
+  pwm_right = pwm_speed + pwm_turn;
   if( pwm_right < 0 )
   {
-    pwm_right = -pwm_right + pwm_min;
+    pwm_right = -pwm_right;
     dir_right = HIGH;
   }
-  else if( pwm_right > 0 )
-  {
-    pwm_right = pwm_right + pwm_min;
+  else
     dir_right = LOW;
-  }
+
+  if( pwm_right > 0 && pwm_right < pwm_min )
+    pwm_right = pwm_min;
+  if( pwm_right > 255 )
+    pwm_right = 255;
   
-  pwm_left  = robot.drive.speed - robot.drive.turn;
+  pwm_left = pwm_speed - pwm_turn;
   if( pwm_left < 0 )
   {
-    pwm_left = -pwm_left + pwm_min;
+    pwm_left = -pwm_left;
     dir_left = HIGH;
   }
-  else if( pwm_left > 0 )
-  {
-    pwm_left = pwm_left + pwm_min;
+  else
     dir_left = LOW;
-  }
 
-  analogWrite(pin_motor_pwm_right, highByte(pwm_right));
-  analogWrite(pin_motor_pwm_left, highByte(pwm_left));
+  if( pwm_left > 0 && pwm_left < pwm_min )
+    pwm_left = pwm_min;
+  if( pwm_left > 255 )
+    pwm_left = 255;
+
   digitalWrite(pin_motor_dir_right, dir_right);
+  analogWrite(pin_motor_pwm_right, pwm_right);
   digitalWrite(pin_motor_dir_left, dir_left);
+  analogWrite(pin_motor_pwm_left, pwm_left);
 }
 
 
-
-#define min_pulse_ms 100
 
 /*******************************************************
  * UpdateLED()
@@ -267,6 +217,7 @@ void UpdateDrive(void)
  *           rate of pulsation is determined by function
  *           voltage2millis()
  *******************************************************/
+/*
 void UpdateLED(void)
 {
   static byte state;
@@ -293,7 +244,7 @@ void UpdateLED(void)
   }
 
 }
-
+*/
 
 /*******************************************************
  * voltage2millis()
@@ -301,6 +252,7 @@ void UpdateLED(void)
  *  indicator LED.
  *  lower the voltage -> shorter the duration.
  *******************************************************/
+/*
 unsigned long voltage2millis(void)
 {
   // lowest battery level is 0.9V per cell
@@ -308,6 +260,21 @@ unsigned long voltage2millis(void)
     return min_pulse_ms; // alarm!
   else
     return (robot.power.battery_miV - (uint16_t)(6 * 0.9 * 1024)) * 2 + min_pulse_ms;
+}
+*/
+
+/*******************************************************
+ * 
+ *******************************************************/
+float BatteryPercentage(float vbat)
+{
+  float percentage = (vbat/BAT_N_CELLS - BAT_CELL_VMIN) / (BAT_CELL_VMAX - BAT_CELL_VMIN);
+  if( percentage < 0.0 )
+    return 0.0;  
+  else if( percentage > 1.0 )
+    return 1.0;
+  else
+    return percentage;
 }
 
 
@@ -371,26 +338,26 @@ int analogReadAvg(int pin, int avg)
 
 /*******************************************************
  * ChargingState()
- *  determines charging state by measuring voltage on 
+ *  calculates charging state using voltage on 
  *  dual-color LED of Graupner 6425 charger.
  * parameter:
  *   adc - raw analog input voltage measurement
  * returns: 
- *   a constant as defined by cRobot::eChargerState
+ *   a constant as defined by BatteryState::POWER_SUPPLY_STATUS_...
  *******************************************************/
-cRobot::eChargerState ChargingState(int adc)
+uint8_t ChargingState(int adc)
 {
   const int thrd1 = 80;
   const int thrd2 = 200;
   const int thrd3 = 800;
   
   if( adc < thrd1 )
-    return cRobot::CHGR_CHARGE;
+    return BatteryState::POWER_SUPPLY_STATUS_CHARGING;
   else if( adc >= thrd1 && adc < thrd2 )
-    return cRobot::CHGR_OFF;
+    return BatteryState::POWER_SUPPLY_STATUS_DISCHARGING;
   else if( adc >= thrd2 && adc < thrd3 )
-    return cRobot::CHGR_INIT;
+    return BatteryState::POWER_SUPPLY_STATUS_NOT_CHARGING;
   else //if( adc >= thrd3 )
-    return cRobot::CHGR_TRICKLE;
+    return BatteryState::POWER_SUPPLY_STATUS_FULL;
 }
 
