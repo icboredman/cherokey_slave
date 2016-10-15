@@ -5,6 +5,11 @@
  * 
  * boredman@boredomprojects.net
  * 
+ * rev 3.0 - 2016.10.10
+ *    - use Teensy3.2 instead of Pro Mini
+ *    - modified hardware and software for VCC=3.3V
+ *    * inaccurate ADC measurements -> should change sampling speed
+ * 
  * rev 2.3 - 2016.07.16
  *    - put back LED battery indicator
  *
@@ -24,11 +29,9 @@
  *    
  * rev 1.0 - 2016.05.18
  *    - initial version
- * uses
- *    "Wire" library for I2C communication
  * ---------------------------------------------------
  */
-
+#define USE_TEENSY_HW_SERIAL
 #include <ros.h>
 #include <geometry_msgs/Twist.h>
 #include <sensor_msgs/BatteryState.h>
@@ -36,21 +39,21 @@
 using namespace sensor_msgs;
 
 const int digPin_LED = 13;
-const int digPin_SHD = 2;
+const int digPin_SHD = 7;
 
 // power supply pins
-const int anlgPin_VBat = 0;
-const int anlgPin_IBat = 1;
+const int anlgPin_IBat = 0;
+const int anlgPin_VBat = 1;
 const int anlgPin_Stat = 2;
 const int anlgPin_Vs   = 3;
 
 // motor drive pins (PWM must be on pins 9 and 10)
-const int pin_motor_pwm_right =  9;  // M1-PWM
-const int pin_motor_dir_right = 11;  // M1-DIR
-const int pin_motor_pwm_left  = 10;  // M2-PWM
-const int pin_motor_dir_left  =  8;  // M2-DIR
+const int pin_motor_pwm_right = 10;  // M1-PWM
+const int pin_motor_dir_right = 12;  // M1-DIR
+const int pin_motor_pwm_left  =  9;  // M2-PWM
+const int pin_motor_dir_left  = 11;  // M2-DIR
 
-#define VCC (5.0f)
+#define VCC (3.31f)
 
 #define BAT_N_CELLS    6
 #define BAT_CELL_VMAX  1.4
@@ -76,7 +79,13 @@ void callback_cmd_vel(const geometry_msgs::Twist& cmd_vel)
   got_new_vel = true;
 }
 
-ros::NodeHandle nh;
+// http://answers.ros.org/question/217986/rosserial-with-teensy-31-comm-port/
+class NewHardware : public ArduinoHardware
+{
+  public:
+  NewHardware():ArduinoHardware(&Serial1, 115200){}; // Specify which port you want to use
+};
+ros::NodeHandle_<NewHardware> nh;
 
 ros::Subscriber<geometry_msgs::Twist> sub_vel("cherokey/cmd_vel", &callback_cmd_vel );
 
@@ -99,7 +108,6 @@ void setup()
   bat_msg.power_supply_technology = BatteryState::POWER_SUPPLY_TECHNOLOGY_NIMH;
   bat_msg.present = true;
 
-  nh.getHardware()->setBaud(115200);
   nh.initNode();
   nh.advertise(pub_bat);
   nh.subscribe(sub_vel);
@@ -118,7 +126,10 @@ void setup()
   // This should not cause interference to delay() amd millis(),
   // as those functions use timer0 and timer2.
   // (http://playground.arduino.cc/Code/PwmFrequency)
-  TCCR1B = TCCR1B & 0b11111000 | 0x05;  // about 30 Hz
+//  TCCR1B = TCCR1B & 0b11111000 | 0x05;  // about 30 Hz
+
+  // 50Hz or so
+  analogWriteFrequency(pin_motor_pwm_right, 50);
 }
 
 
@@ -132,7 +143,7 @@ void loop()
   if( time_now - time_prev > 1000 )
   {
     time_prev = time_now;
-    
+
     int bat_miV, bat_miA;
     BatteryVIavg(&bat_miV, &bat_miA, anlgPin_VBat, anlgPin_IBat, 100);
     int vs_miV = analogReadAvg(anlgPin_Vs, 100) * (39+39+4.7)/4.7 * VCC;
@@ -143,7 +154,7 @@ void loop()
     bat_msg.charge = vs_miV / 1024.0; // use for VS
     bat_msg.power_supply_status = ChargingState(state_adc);
     bat_msg.percentage = BatteryPercentage(bat_msg.voltage);
-    
+
     pub_bat.publish(&bat_msg);
   }
 
@@ -265,7 +276,7 @@ void UpdateLED(float percentage)
  *******************************************************/
 void BatteryVIavg(int* miV, int* miA, int pinV, int pinI, int avg)
 {
-  int adcV, adcI;
+  int adcV, adcI; long sumadc=0;
   float fV, fI;
   float sumV=0, sumI=0;
 
@@ -276,16 +287,18 @@ void BatteryVIavg(int* miV, int* miA, int pinV, int pinI, int avg)
     adcV = analogRead(pinV);
 
     // negative voltage across current sensing resistor R11 (0.22 ohm)
-    // is measured with a resistor divider (100K/100K) to 5V
-    fI = (float)adcI * 2.002 - (5.0/VCC)*1024;
+    // is measured with a resistor divider (100K/100K) to VCC
+    fI = (float)adcI * 2.0 - 1024;
     // the above subtracted from voltage measurement to get true battery voltage,
-    // while factoring in its resistor divider (100K/100K)
-    fV = (float)adcV * 1.995 - fI;
+    // while factoring in its resistor divider (100K/50K)
+    fV = (float)adcV * 3.0 - fI;
     
     // accumulate averages (still in adc counts)
     sumI += fI;
     sumV += fV;
+    sumadc += adcI;
   }
+bat_msg.capacity = sumadc / avg * VCC / 1024;
 
   // scale results into milli(binary)-volts or -amperes
   // so, no need to divide by ADC resolution (i.e. 1024)
@@ -320,9 +333,9 @@ int analogReadAvg(int pin, int avg)
  *******************************************************/
 uint8_t ChargingState(int adc)
 {
-  const int thrd1 = 80;
-  const int thrd2 = 200;
-  const int thrd3 = 800;
+  const int thrd1 = 61;   //80;
+  const int thrd2 = 152;  //200;
+  const int thrd3 = 606;  //800;
   
   if( adc < thrd1 )
     return BatteryState::POWER_SUPPLY_STATUS_CHARGING;
