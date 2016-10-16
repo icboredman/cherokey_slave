@@ -1,10 +1,19 @@
 /* ---------------------------------------------------
- * Robot Slave sketch running on Pro Mini
+ * Robot Slave sketch running on Teensy 3.2
  * monitors battery voltage, current consumption and charging,
- * communicates this to Master Raspberry Pi over I2C connection.
+ * communicates this to Master Raspberry Pi over Serial connection.
  * 
  * boredman@boredomprojects.net
  * 
+ * rev 3.1 - 2016.10.16
+ *    - using analogComp library for battery charging status measurements
+ *        Teensy support from: https://github.com/orangkucing/analogComp
+ *        added comparator polling from: https://github.com/rlagerweij/analogComp
+ *        added 6-bit dac as reference
+ *    - using ADC library from: https://github.com/pedvide/ADC
+ *        background synchronous V-I measurements
+ *        hardware averaging
+ *      
  * rev 3.0 - 2016.10.10
  *    - use Teensy3.2 instead of Pro Mini
  *    - modified hardware and software for VCC=3.3V
@@ -31,6 +40,13 @@
  *    - initial version
  * ---------------------------------------------------
  */
+
+// Teensy analog comparator library
+#include "analogComp.h"
+
+// Teensy ADC library
+#include "ADC.h"
+
 #define USE_TEENSY_HW_SERIAL
 #include <ros.h>
 #include <geometry_msgs/Twist.h>
@@ -39,19 +55,19 @@
 using namespace sensor_msgs;
 
 const int digPin_LED = 13;
-const int digPin_SHD = 7;
+const int digPin_SHD = 6;
 
 // power supply pins
-const int anlgPin_IBat = 0;
-const int anlgPin_VBat = 1;
-const int anlgPin_Stat = 2;
-const int anlgPin_Vs   = 3;
+const int anlgPin_IBat = A1;
+const int anlgPin_VBat = A2;
+const int anlgPin_VS   = A3;
+const int compPin_Stat = 11;
 
 // motor drive pins (PWM must be on pins 9 and 10)
-const int pin_motor_pwm_right = 10;  // M1-PWM
-const int pin_motor_dir_right = 12;  // M1-DIR
-const int pin_motor_pwm_left  =  9;  // M2-PWM
-const int pin_motor_dir_left  = 11;  // M2-DIR
+const int pin_motor_pwm_left  = 10;  // M2-PWM
+const int pin_motor_pwm_right =  9;  // M1-PWM
+const int pin_motor_dir_left  =  8;  // M2-DIR
+const int pin_motor_dir_right =  7;  // M1-DIR
 
 #define VCC (3.31f)
 
@@ -93,6 +109,10 @@ BatteryState bat_msg;
 ros::Publisher pub_bat("cherokey/battery", &bat_msg);
 
 
+ADC *adc = new ADC(); // adc object
+ADC::Sync_result adcRes;
+
+
 /*******************************************************
  * SETUP function runs once on power-up or reset
  *******************************************************/
@@ -130,6 +150,20 @@ void setup()
 
   // 50Hz or so
   analogWriteFrequency(pin_motor_pwm_right, 50);
+
+  // configure analog comparator for battery charging state
+  analogComparator.setOn(0, 7);   // 0 = compPin_Stat (pin 11),  7 = 6bit DAC (ref)
+
+  // configure ADC for V, I and VS measurements
+  adc->setAveraging(32);
+  adc->setResolution(10);
+  adc->setConversionSpeed(ADC_VERY_LOW_SPEED);
+  adc->setSamplingSpeed(ADC_VERY_LOW_SPEED);
+  adc->setAveraging(32, ADC_1);
+  adc->setResolution(10, ADC_1);
+  adc->setConversionSpeed(ADC_VERY_LOW_SPEED, ADC_1);
+  adc->setSamplingSpeed(ADC_VERY_LOW_SPEED, ADC_1);
+  adc->startSynchronizedContinuous(anlgPin_IBat, anlgPin_VBat);
 }
 
 
@@ -144,15 +178,25 @@ void loop()
   {
     time_prev = time_now;
 
-    int bat_miV, bat_miA;
-    BatteryVIavg(&bat_miV, &bat_miA, anlgPin_VBat, anlgPin_IBat, 100);
-    int vs_miV = analogReadAvg(anlgPin_Vs, 100) * (39+39+4.7)/4.7 * VCC;
-    int state_adc = analogReadAvg(anlgPin_Stat, 100);
+    // get results from most recent V-I measurements
+    adcRes = adc->readSynchronizedContinuous();
 
-    bat_msg.voltage = bat_miV / 1024.0;
-    bat_msg.current = bat_miA / 1024.0;
-    bat_msg.charge = vs_miV / 1024.0; // use for VS
-    bat_msg.power_supply_status = ChargingState(state_adc);
+    // negative voltage across current sensing resistor R11 (0.22 ohm)
+    // is measured with a resistor divider 100K/(100K||100K) to (VCC||GND)
+    float fI = (float)adcRes.result_adc0 * 3.0 - adc->getMaxValue(ADC_0);
+    // the above subtracted from voltage measurement to get true battery voltage,
+    // while factoring in its resistor divider (100K/50K)
+    float fV = (float)adcRes.result_adc1 * 3.0 - fI;
+
+    // interrupt continuous V-I and do one-shot VS measurement
+    float fVS = analogRead(anlgPin_VS) * (39+39+4.7)/4.7;
+    // restart continuous V-I measurements
+    adc->startSynchronizedContinuous(anlgPin_IBat, anlgPin_VBat);
+
+    bat_msg.current = (fI * VCC / 0.22) / adc->getMaxValue(ADC_0);
+    bat_msg.voltage = (fV * VCC) / adc->getMaxValue(ADC_1);
+    bat_msg.charge = (fVS * VCC) / adc->getMaxValue(ADC_0); // use for VS
+    bat_msg.power_supply_status = ChargingState();
     bat_msg.percentage = BatteryPercentage(bat_msg.voltage);
 
     pub_bat.publish(&bat_msg);
@@ -238,8 +282,8 @@ float BatteryPercentage(float vbat)
  * UpdateLED()
  *  controls state of LED - indicator of battery voltage
  *  according to percentage:
- *  - LED pulsed according to battery voltage.
- *    rate of pulsation is determined by function voltage2millis()
+ *  - ON time is always 100ms
+ *  - OFF time varies between 100ms and 5.1sec proportionally to VBat
  *******************************************************/
 void UpdateLED(float percentage)
 {
@@ -263,87 +307,39 @@ void UpdateLED(float percentage)
 
 
 /*******************************************************
- * BatteryVIavg()
- *  measures and reports battery Voltage and Current.
- * parameters:
- *   pinV - analog pin for voltage measurements
- *   pinI - analog pin for current measurements
- *          (as voltage across a current sensing resistor)
- *   avg  - number of averages to take before returning
- * results returned using:
- *   miV  - battery voltage in units of [volts x 1024]
- *   miA  - battery current in units of [amperes x 1024]
- *******************************************************/
-void BatteryVIavg(int* miV, int* miA, int pinV, int pinI, int avg)
-{
-  int adcV, adcI; long sumadc=0;
-  float fV, fI;
-  float sumV=0, sumI=0;
-
-  for(int i=0; i<avg; i++)
-  {
-    // sample ADC pins
-    adcI = analogRead(pinI);
-    adcV = analogRead(pinV);
-
-    // negative voltage across current sensing resistor R11 (0.22 ohm)
-    // is measured with a resistor divider (100K/100K) to VCC
-    fI = (float)adcI * 2.0 - 1024;
-    // the above subtracted from voltage measurement to get true battery voltage,
-    // while factoring in its resistor divider (100K/50K)
-    fV = (float)adcV * 3.0 - fI;
-    
-    // accumulate averages (still in adc counts)
-    sumI += fI;
-    sumV += fV;
-    sumadc += adcI;
-  }
-bat_msg.capacity = sumadc / avg * VCC / 1024;
-
-  // scale results into milli(binary)-volts or -amperes
-  // so, no need to divide by ADC resolution (i.e. 1024)
-  *miV = (int)((sumV / avg) * VCC);
-  *miA = (int)((sumI / avg) * VCC / 0.22);
-}
-
-
-/*******************************************************
- * analogReadAvg()
- *  implements analogRead() functionality, but with averaging.
- *******************************************************/
-int analogReadAvg(int pin, int avg)
-{
-  long sum = 0;
-  for(int i=0; i<avg; i++)
-  {
-    sum += analogRead(pin);
-  }
-  return (int)(sum / avg);
-}
-
-
-/*******************************************************
  * ChargingState()
- *  calculates charging state using voltage on 
+ *  calculates charging state based on voltage at 
  *  dual-color LED of Graupner 6425 charger.
- * parameter:
- *   adc - raw analog input voltage measurement
+ *  uses analog comparator of Teensy
  * returns: 
  *   a constant as defined by BatteryState::POWER_SUPPLY_STATUS_...
  *******************************************************/
-uint8_t ChargingState(int adc)
+uint8_t ChargingState()
 {
-  const int thrd1 = 61;   //80;
-  const int thrd2 = 152;  //200;
-  const int thrd3 = 606;  //800;
-  
-  if( adc < thrd1 )
-    return BatteryState::POWER_SUPPLY_STATUS_CHARGING;
-  else if( adc >= thrd1 && adc < thrd2 )
-    return BatteryState::POWER_SUPPLY_STATUS_DISCHARGING;
-  else if( adc >= thrd2 && adc < thrd3 )
-    return BatteryState::POWER_SUPPLY_STATUS_NOT_CHARGING;
-  else //if( adc >= thrd3 )
-    return BatteryState::POWER_SUPPLY_STATUS_FULL;
+  const int thrd1 = 4;    //0.2 V;
+  const int thrd2 = 15;   //0.8 V;
+  const int thrd3 = 36;   //1.9 V;
+
+  analogComparator.configureDac(thrd2);
+  delay(10);
+  if( analogComparator.getOutput() )
+  {
+    analogComparator.configureDac(thrd3);
+    delay(10);
+    if( analogComparator.getOutput() )
+      return BatteryState::POWER_SUPPLY_STATUS_FULL;
+    else
+      return BatteryState::POWER_SUPPLY_STATUS_NOT_CHARGING;
+  }
+  else
+  {
+    analogComparator.configureDac(thrd1);
+    delay(10);
+    if( analogComparator.getOutput() )
+      return BatteryState::POWER_SUPPLY_STATUS_DISCHARGING;
+    else
+      return BatteryState::POWER_SUPPLY_STATUS_CHARGING;
+  }
 }
+
 

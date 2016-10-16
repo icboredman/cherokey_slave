@@ -1,0 +1,4 @@
+0.07 V		charging
+0.33 V		discharging
+1.28 V		not charging
+2.46 V		full
