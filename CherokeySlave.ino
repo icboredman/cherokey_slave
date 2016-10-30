@@ -5,6 +5,9 @@
  * 
  * boredman@boredomprojects.net
  * 
+ * rev 3.2 - 2016.10.31
+ *    - added /tf orientation transform broadcasting
+ * 
  * rev 3.1 - 2016.10.16
  *    - using analogComp library for battery charging status measurements
  *        Teensy support from: https://github.com/orangkucing/analogComp
@@ -40,6 +43,9 @@
  *    - initial version
  * ---------------------------------------------------
  */
+#include <i2c_t3.h>
+#include <Adafruit_BNO055_t3.h>
+#include <EEPROM.h>
 
 // Teensy analog comparator library
 #include "analogComp.h"
@@ -51,6 +57,8 @@
 #include <ros.h>
 #include <geometry_msgs/Twist.h>
 #include <sensor_msgs/BatteryState.h>
+#include <tf/tf.h>
+#include <tf/transform_broadcaster.h>
 
 using namespace sensor_msgs;
 
@@ -95,23 +103,37 @@ void callback_cmd_vel(const geometry_msgs::Twist& cmd_vel)
   got_new_vel = true;
 }
 
-// http://answers.ros.org/question/217986/rosserial-with-teensy-31-comm-port/
-class NewHardware : public ArduinoHardware
-{
-  public:
-  NewHardware():ArduinoHardware(&Serial1, 115200){}; // Specify which port you want to use
-};
-ros::NodeHandle_<NewHardware> nh;
+ros::NodeHandle nh;
 
 ros::Subscriber<geometry_msgs::Twist> sub_vel("cherokey/cmd_vel", &callback_cmd_vel );
 
 BatteryState bat_msg;
 ros::Publisher pub_bat("cherokey/battery", &bat_msg);
 
+geometry_msgs::TransformStamped t;
+char base_link[] = "/base_link";
+char odom[] = "/odom";
+double x = 0.0;
+double y = 0.0;
+double theta = 0.0;
 
+tf::TransformBroadcaster odom_broadcaster;
+
+
+#define ADC_SAMPLERATE_DELAY_MS (1000)
 ADC *adc = new ADC(); // adc object
 ADC::Sync_result adcRes;
 
+
+// IMU sensor interface (I2C bus)
+// https://forums.adafruit.com/viewtopic.php?f=19&t=92153
+#define IMU_SENSOR_ID (55)
+#define IMU_SAMPLERATE_DELAY_MS (50)
+Adafruit_BNO055 bno = Adafruit_BNO055(WIRE_BUS, IMU_SENSOR_ID, BNO055_ADDRESS_A, 
+                                      I2C_MASTER, I2C_PINS_18_19, I2C_PULLUP_INT, 
+                                      I2C_RATE_1000, I2C_OP_MODE_ISR);
+
+char str[100];
 
 /*******************************************************
  * SETUP function runs once on power-up or reset
@@ -119,18 +141,10 @@ ADC::Sync_result adcRes;
 void setup() 
 {
   pinMode(digPin_LED, OUTPUT);
+  digitalWrite(digPin_LED, LOW);
 
   pinMode(digPin_SHD, OUTPUT);
   digitalWrite(digPin_SHD, LOW);
-
-  // populate some constant values
-  bat_msg.design_capacity = 2500.0;
-  bat_msg.power_supply_technology = BatteryState::POWER_SUPPLY_TECHNOLOGY_NIMH;
-  bat_msg.present = true;
-
-  nh.initNode();
-  nh.advertise(pub_bat);
-  nh.subscribe(sub_vel);
 
   pinMode(pin_motor_pwm_right, OUTPUT);
   digitalWrite(pin_motor_pwm_right, LOW);
@@ -141,14 +155,8 @@ void setup()
   pinMode(pin_motor_dir_left, OUTPUT);
   digitalWrite(pin_motor_dir_left, LOW);
 
-  // Reduce PWM frequency for timer1 (pins 9 and 10) to about 30 Hz,
-  // to prevent buzzing sounds from motors.
-  // This should not cause interference to delay() amd millis(),
-  // as those functions use timer0 and timer2.
-  // (http://playground.arduino.cc/Code/PwmFrequency)
-//  TCCR1B = TCCR1B & 0b11111000 | 0x05;  // about 30 Hz
-
-  // 50Hz or so
+  // Reduce PWM frequency to 50Hz or so
+  // to reduce buzzing sounds from motors
   analogWriteFrequency(pin_motor_pwm_right, 50);
 
   // configure analog comparator for battery charging state
@@ -164,6 +172,68 @@ void setup()
   adc->setConversionSpeed(ADC_VERY_LOW_SPEED, ADC_1);
   adc->setSamplingSpeed(ADC_VERY_LOW_SPEED, ADC_1);
   adc->startSynchronizedContinuous(anlgPin_IBat, anlgPin_VBat);
+
+  // populate some constant values
+  bat_msg.design_capacity = 2500.0;
+  bat_msg.power_supply_technology = BatteryState::POWER_SUPPLY_TECHNOLOGY_NIMH;
+  bat_msg.present = true;
+
+  nh.initNode();
+
+  nh.advertise(pub_bat);
+  nh.subscribe(sub_vel);
+
+  odom_broadcaster.init(nh);
+
+  // Initialise IMU sensor
+  if( ! bno.begin() )
+  {
+    nh.logerror("[TNSY] no IMU detected -> STOP");
+    while(1)
+      nh.spinOnce();
+  }
+
+  int eeAddress = 0;
+  long imuID;
+
+  EEPROM.get(eeAddress, imuID);
+
+  if( imuID != IMU_SENSOR_ID )
+  {
+    nh.logerror("[TNSY] no IMU calibration data in EEPROM -> STOP");
+    while(1)
+      nh.spinOnce();
+  }
+
+  adafruit_bno055_offsets_t calibrationData;
+  eeAddress += sizeof(long);
+  EEPROM.get(eeAddress, calibrationData);
+  bno.setSensorOffsets(calibrationData);
+  delay(1000);
+
+  uint8_t system_status, self_test_results, system_error;
+  bno.getSystemStatus(&system_status, &self_test_results, &system_error);
+  sprintf(str,"[TNSY] IMU status:%d self-test:%d error:%d",system_status,self_test_results,system_error);
+  nh.loginfo(str);
+  
+  bno.setExtCrystalUse(true);
+
+  nh.loginfo("[TNSY] move IMU slightly to calibrate magnetometers");
+
+  uint8_t system, gyro, accel, mag;
+  do {
+    nh.spinOnce();
+    digitalWrite(digPin_LED, HIGH);
+    bno.getCalibration(&system, &gyro, &accel, &mag);
+    sprintf(str,"[TNSY] S:%d G:%d A:%d M:%d",system,gyro,accel,mag);
+    nh.loginfo(str);
+    delay(450);
+    digitalWrite(digPin_LED, LOW);
+    delay(50);
+  } while( system < 3 || gyro < 3 || accel < 3 || mag < 3 );  // !bno.isFullyCalibrated()
+  digitalWrite(digPin_LED, LOW);
+
+  nh.loginfo("[TNSY] Init done");
 }
 
 
@@ -172,11 +242,113 @@ void setup()
  *******************************************************/
 void loop() 
 {
-  static unsigned long time_prev;
+//  static unsigned long time_prev;
+//  unsigned long time_now = millis();
+//  if( time_now - time_prev > IMU_SAMPLERATE_DELAY_MS )
+//  {
+//    time_prev = time_now;
+//    
+//    // Possible vector values can be:
+//    // - VECTOR_ACCELEROMETER - m/s^2
+//    // - VECTOR_MAGNETOMETER  - uT
+//    // - VECTOR_GYROSCOPE     - rad/s
+//    // - VECTOR_EULER         - degrees
+//    // - VECTOR_LINEARACCEL   - m/s^2
+//    // - VECTOR_GRAVITY       - m/s^2
+//    bno::Vector<3> euler = bno.getVector(Adafruit_BNO055::VECTOR_EULER);
+//  
+//    /* Display the floating point data */
+//    Serial.print("X: ");
+//    Serial.print(euler.x());
+//    Serial.print(" Y: ");
+//    Serial.print(euler.y());
+//    Serial.print(" Z: ");
+//    Serial.print(euler.z());
+//    Serial.print("  \t");
+//  
+//    euler = bno.getVector(Adafruit_BNO055::VECTOR_LINEARACCEL);
+//  
+//    /* Display the floating point data */
+//    Serial.print("X: ");
+//    Serial.print(euler.x());
+//    Serial.print(" Y: ");
+//    Serial.print(euler.y());
+//    Serial.print(" Z: ");
+//    Serial.print(euler.z());
+//    Serial.print("  \t");
+//  
+//    /*
+//    // Quaternion data
+//    bno::Quaternion quat = bno.getQuat();
+//    Serial.print("qW: ");
+//    Serial.print(quat.w(), 4);
+//    Serial.print(" qX: ");
+//    Serial.print(quat.y(), 4);
+//    Serial.print(" qY: ");
+//    Serial.print(quat.x(), 4);
+//    Serial.print(" qZ: ");
+//    Serial.print(quat.z(), 4);
+//    Serial.print("\t\t");
+//    */
+//  
+//    /* Display calibration status for each sensor. */
+//    uint8_t system, gyro, accel, mag = 0;
+//    bno.getCalibration(&system, &gyro, &accel, &mag);
+//    Serial.print("CALIBRATION: Sys=");
+//    Serial.print(system, DEC);
+//    Serial.print(" Gyro=");
+//    Serial.print(gyro, DEC);
+//    Serial.print(" Accel=");
+//    Serial.print(accel, DEC);
+//    Serial.print(" Mag=");
+//    Serial.println(mag, DEC);
+//
+//  }
+
+  static unsigned long time_prev_adc, time_prev_imu;
   unsigned long time_now = millis();
-  if( time_now - time_prev > 1000 )
+
+  if( time_now - time_prev_imu > IMU_SAMPLERATE_DELAY_MS )
   {
-    time_prev = time_now;
+    time_prev_imu = time_now;
+
+//    imu::Vector<3> euler = bno.getVector(Adafruit_BNO055::VECTOR_EULER);
+    imu::Quaternion quat = bno.getQuat();
+    imu::Vector<3> euler = quat.toEuler();
+    theta = euler.x();
+    
+//    double dx = 0.0;
+//    double dtheta = 0.0;
+//    x += cos(theta)*dx*0.1;
+//    y += sin(theta)*dx*0.1;
+//    theta += dtheta*0.1;
+//    if(theta > 3.14)
+//      theta=-3.14;
+
+    // tf odom->base_link
+    t.header.frame_id = odom;
+    t.child_frame_id = base_link;
+  
+    t.transform.translation.x = x;
+    t.transform.translation.y = y;
+  
+    geometry_msgs::Quaternion Quat = geometry_msgs::Quaternion();
+    Quat.x = quat.x();
+    Quat.y = quat.y();
+    Quat.z = quat.z();
+    Quat.w = quat.w();
+    t.transform.rotation = Quat;    // = tf::createQuaternionFromYaw(theta);
+
+    t.header.stamp = nh.now();
+  
+    odom_broadcaster.sendTransform(t);
+    nh.spinOnce();
+  }
+
+
+  if( time_now - time_prev_adc > ADC_SAMPLERATE_DELAY_MS )
+  {
+    time_prev_adc = time_now;
 
     // get results from most recent V-I measurements
     adcRes = adc->readSynchronizedContinuous();
