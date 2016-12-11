@@ -5,7 +5,12 @@
  * 
  * boredman@boredomprojects.net
  * 
+ * rev 3.3 - 2016.12.11
+ *    - position calculation using optical wheel encoders
+ *    - orientation calculation using IMU data
+ * 
  * rev 3.2 - 2016.10.31
+ *    - implemented interface to BNO055 IMU sensor
  *    - added /tf orientation transform broadcasting
  * 
  * rev 3.1 - 2016.10.16
@@ -68,7 +73,7 @@ const int digPin_SHD = 6;
 // power supply pins
 const int anlgPin_IBat = A1;
 const int anlgPin_VBat = A2;
-const int anlgPin_VS   = A3;
+const int anlgPin_VS   = A0;
 const int compPin_Stat = 11;
 
 // motor drive pins (PWM must be on pins 9 and 10)
@@ -77,6 +82,18 @@ const int pin_motor_pwm_right =  9;  // M1-PWM
 const int pin_motor_dir_left  =  8;  // M2-DIR
 const int pin_motor_dir_right =  7;  // M1-DIR
 
+// encoder pins
+const int pin_enc_fr_left = 22;   // PTC1
+const int pin_enc_bk_left = 20;   // PTD5
+const int pin_enc_fr_right = 23;  // PTC2
+const int pin_enc_bk_right = 21;  // PTD6
+
+// direct pin interrupt implementation did not work,
+// because of some conflict with PWM.
+// Therefore, implemented periodic interrupt which samples
+// all four pins and updates counters on pin change.
+IntervalTimer encoderTimer;
+
 #define VCC (3.31f)
 
 #define BAT_N_CELLS    6
@@ -84,9 +101,12 @@ const int pin_motor_dir_right =  7;  // M1-DIR
 #define BAT_CELL_VMIN  0.9
 
 // linear speed in [m/s] corresponding to max pwm
-#define top_speed_m_s  0.7
+#define TOP_SPEED_M_S  0.7
 // half the distance between wheels in [m]
-#define turn_radius_m  0.072
+#define TURN_RADIUS_M  0.072
+
+#define WHEEL_DIAM_M   0.063
+#define ENCODER_STEPS  40
 
 // velocity vector in units of [pwm counts]
 int pwm_speed = 0;
@@ -97,9 +117,9 @@ bool got_new_vel = false;
 void callback_cmd_vel(const geometry_msgs::Twist& cmd_vel)
 {
   // top_speed in m/s corresponds to pwm count of 255
-  pwm_speed = (int)(cmd_vel.linear.x * 255 / top_speed_m_s);
+  pwm_speed = (int)(cmd_vel.linear.x * 255 / TOP_SPEED_M_S);
   // 1 rad/s at stand still corresponds to +/-(distance between wheels / 2)
-  pwm_turn  = (int)(cmd_vel.angular.z * turn_radius_m * 255 / top_speed_m_s);
+  pwm_turn  = (int)(cmd_vel.angular.z * TURN_RADIUS_M * 255 / TOP_SPEED_M_S);
   got_new_vel = true;
 }
 
@@ -110,14 +130,17 @@ ros::Subscriber<geometry_msgs::Twist> sub_vel("cherokey/cmd_vel", &callback_cmd_
 BatteryState bat_msg;
 ros::Publisher pub_bat("cherokey/battery", &bat_msg);
 
-geometry_msgs::TransformStamped t;
+// motors & encoders
+int16_t pwm_right, pwm_left;
+bool dir_right, dir_left;
+volatile unsigned long enc_cntr_fr_left, enc_cntr_fr_right;
+volatile unsigned long enc_cntr_bk_left, enc_cntr_bk_right;
+
+// odometry
+geometry_msgs::TransformStamped odom_tf;
+tf::TransformBroadcaster odom_broadcaster;
 char base_link[] = "/base_link";
 char odom[] = "/odom";
-double x = 0.0;
-double y = 0.0;
-double theta = 0.0;
-
-tf::TransformBroadcaster odom_broadcaster;
 
 
 #define ADC_SAMPLERATE_DELAY_MS (1000)
@@ -128,7 +151,7 @@ ADC::Sync_result adcRes;
 // IMU sensor interface (I2C bus)
 // https://forums.adafruit.com/viewtopic.php?f=19&t=92153
 #define IMU_SENSOR_ID (55)
-#define IMU_SAMPLERATE_DELAY_MS (50)
+#define IMU_SAMPLERATE_DELAY_MS (100)
 Adafruit_BNO055 bno = Adafruit_BNO055(WIRE_BUS, IMU_SENSOR_ID, BNO055_ADDRESS_A, 
                                       I2C_MASTER, I2C_PINS_18_19, I2C_PULLUP_INT, 
                                       I2C_RATE_1000, I2C_OP_MODE_ISR);
@@ -233,8 +256,20 @@ void setup()
   } while( system < 3 || gyro < 3 || accel < 3 || mag < 3 );  // !bno.isFullyCalibrated()
   digitalWrite(digPin_LED, LOW);
 
+  pinMode(pin_enc_fr_left, INPUT_PULLUP);
+  pinMode(pin_enc_bk_left, INPUT_PULLUP);
+  pinMode(pin_enc_fr_right, INPUT_PULLUP);
+  pinMode(pin_enc_bk_right, INPUT_PULLUP);
+
+  // periodic interrupt servicing wheel encoders
+  // min encoder half-period at max speed (0.7m/s) is 7ms
+  encoderTimer.begin(EncoderService, 1000);
+
   nh.loginfo("[TNSY] Init done");
+
+//  Serial.begin(57600);
 }
+
 
 
 /*******************************************************
@@ -242,106 +277,87 @@ void setup()
  *******************************************************/
 void loop() 
 {
-//  static unsigned long time_prev;
-//  unsigned long time_now = millis();
-//  if( time_now - time_prev > IMU_SAMPLERATE_DELAY_MS )
-//  {
-//    time_prev = time_now;
-//    
-//    // Possible vector values can be:
-//    // - VECTOR_ACCELEROMETER - m/s^2
-//    // - VECTOR_MAGNETOMETER  - uT
-//    // - VECTOR_GYROSCOPE     - rad/s
-//    // - VECTOR_EULER         - degrees
-//    // - VECTOR_LINEARACCEL   - m/s^2
-//    // - VECTOR_GRAVITY       - m/s^2
-//    bno::Vector<3> euler = bno.getVector(Adafruit_BNO055::VECTOR_EULER);
-//  
-//    /* Display the floating point data */
-//    Serial.print("X: ");
-//    Serial.print(euler.x());
-//    Serial.print(" Y: ");
-//    Serial.print(euler.y());
-//    Serial.print(" Z: ");
-//    Serial.print(euler.z());
-//    Serial.print("  \t");
-//  
-//    euler = bno.getVector(Adafruit_BNO055::VECTOR_LINEARACCEL);
-//  
-//    /* Display the floating point data */
-//    Serial.print("X: ");
-//    Serial.print(euler.x());
-//    Serial.print(" Y: ");
-//    Serial.print(euler.y());
-//    Serial.print(" Z: ");
-//    Serial.print(euler.z());
-//    Serial.print("  \t");
-//  
-//    /*
-//    // Quaternion data
-//    bno::Quaternion quat = bno.getQuat();
-//    Serial.print("qW: ");
-//    Serial.print(quat.w(), 4);
-//    Serial.print(" qX: ");
-//    Serial.print(quat.y(), 4);
-//    Serial.print(" qY: ");
-//    Serial.print(quat.x(), 4);
-//    Serial.print(" qZ: ");
-//    Serial.print(quat.z(), 4);
-//    Serial.print("\t\t");
-//    */
-//  
-//    /* Display calibration status for each sensor. */
-//    uint8_t system, gyro, accel, mag = 0;
-//    bno.getCalibration(&system, &gyro, &accel, &mag);
-//    Serial.print("CALIBRATION: Sys=");
-//    Serial.print(system, DEC);
-//    Serial.print(" Gyro=");
-//    Serial.print(gyro, DEC);
-//    Serial.print(" Accel=");
-//    Serial.print(accel, DEC);
-//    Serial.print(" Mag=");
-//    Serial.println(mag, DEC);
-//
-//  }
-
   static unsigned long time_prev_adc, time_prev_imu;
   unsigned long time_now = millis();
 
   if( time_now - time_prev_imu > IMU_SAMPLERATE_DELAY_MS )
   {
+    double dt = (time_now - time_prev_imu) / 1000.0;
     time_prev_imu = time_now;
 
-//    imu::Vector<3> euler = bno.getVector(Adafruit_BNO055::VECTOR_EULER);
+    ros::Time current_time = nh.now();
+
     imu::Quaternion quat = bno.getQuat();
     imu::Vector<3> euler = quat.toEuler();
-    theta = euler.x();
-    
-//    double dx = 0.0;
-//    double dtheta = 0.0;
-//    x += cos(theta)*dx*0.1;
-//    y += sin(theta)*dx*0.1;
-//    theta += dtheta*0.1;
-//    if(theta > 3.14)
-//      theta=-3.14;
+    double theta = euler.x();
 
-    // tf odom->base_link
-    t.header.frame_id = odom;
-    t.child_frame_id = base_link;
-  
-    t.transform.translation.x = x;
-    t.transform.translation.y = y;
-  
+//    // get linear acceleration in "base_link" frame
+//    imu::Vector<3> accel = bno.getVector(Adafruit_BNO055::VECTOR_LINEARACCEL);
+//    static double ay;
+//    ay = accel.y();
+//    //vx += accel.x() * dt;
+//    vx = 0.0;
+//    if( pwm_speed == 0 )
+//      vy = 0;
+//    else
+//      vy += ay * dt;
+//
+//    // calculate position while translating to "odom" frame
+//    x += (vx * cos(theta) - vy * sin(theta)) * dt;
+//    y += (vx * sin(theta) + vy * cos(theta)) * dt;
+
+    noInterrupts();
+    long cntr_fr_left  = (long)enc_cntr_fr_left;
+    long cntr_bk_left  = (long)enc_cntr_bk_left;
+    long cntr_fr_right = (long)enc_cntr_fr_right;
+    long cntr_bk_right = (long)enc_cntr_bk_right;
+    interrupts();
+
+    static long last_fr_left, last_fr_right;
+    static long last_bk_left, last_bk_right;
+
+    long dif_fr_left  = cntr_fr_left  - last_fr_left;
+    long dif_bk_left  = cntr_bk_left  - last_bk_left;
+    long dif_fr_right = cntr_fr_right - last_fr_right;
+    long dif_bk_right = cntr_bk_right - last_bk_right;
+
+    last_fr_left = cntr_fr_left;
+    last_bk_left = cntr_bk_left;
+    last_fr_right = cntr_fr_right;
+    last_bk_right = cntr_bk_right;
+    
+    double dif_left  = (dif_fr_left + dif_bk_left) / 2.0;
+    double dif_right = (dif_fr_right + dif_bk_right) / 2.0;
+
+    double dx = 0;
+    double dy = (dif_left + dif_right) / 2.0 * PI * WHEEL_DIAM_M / ENCODER_STEPS;
+
+    static double x, y;
+    
+    // calculate position while translating to "odom" frame
+    x -= dy * sin(theta);
+    y += dy * cos(theta);
+
+    // convert imu::Quaternion into geometry_msgs::Quaternion
     geometry_msgs::Quaternion Quat = geometry_msgs::Quaternion();
     Quat.x = quat.x();
     Quat.y = quat.y();
     Quat.z = quat.z();
     Quat.w = quat.w();
-    t.transform.rotation = Quat;    // = tf::createQuaternionFromYaw(theta);
 
-    t.header.stamp = nh.now();
+    //first, we'll publish the transform over tf
+    odom_tf.header.stamp = current_time;
+    odom_tf.header.frame_id = odom;
+    odom_tf.child_frame_id = base_link;
   
-    odom_broadcaster.sendTransform(t);
+    odom_tf.transform.translation.x = x;
+    odom_tf.transform.translation.y = y;
+    odom_tf.transform.translation.z = 0.0;
+    odom_tf.transform.rotation = Quat;    // = tf::createQuaternionFromYaw(theta);
+
+    //send the transform
+    odom_broadcaster.sendTransform(odom_tf);
+
     nh.spinOnce();
   }
 
@@ -395,16 +411,13 @@ void loop()
 #define pwm_min 10
 void UpdateDrive(void)
 {
-  int16_t pwm_right, pwm_left;
-  int8_t  dir_right, dir_left;
-
   pwm_right = pwm_speed + pwm_turn;
   if( pwm_right < 0 )
   {
     pwm_right = -pwm_right;
     dir_right = HIGH;
   }
-  else
+  else if( pwm_right > 0 )
     dir_right = LOW;
 
   if( pwm_right > 0 && pwm_right < pwm_min )
@@ -418,7 +431,7 @@ void UpdateDrive(void)
     pwm_left = -pwm_left;
     dir_left = HIGH;
   }
-  else
+  else if( pwm_left > 0 )
     dir_left = LOW;
 
   if( pwm_left > 0 && pwm_left < pwm_min )
@@ -513,5 +526,50 @@ uint8_t ChargingState()
       return BatteryState::POWER_SUPPLY_STATUS_CHARGING;
   }
 }
+
+
+static void EncoderService(void)
+{
+  static bool last_fr_left, last_bk_left, last_fr_right, last_bk_right;
+
+  bool pin_fr_left  = digitalRead(pin_enc_fr_left);
+  bool pin_bk_left  = digitalRead(pin_enc_bk_left);
+  bool pin_fr_right = digitalRead(pin_enc_fr_right);
+  bool pin_bk_right = digitalRead(pin_enc_bk_right);
+  
+  if( pin_fr_left != last_fr_left )
+  {
+    last_fr_left = pin_fr_left;
+    if( dir_left )
+      enc_cntr_fr_left--;
+    else
+      enc_cntr_fr_left++;
+  }
+  if( pin_bk_left != last_bk_left )
+  {
+    last_bk_left = pin_bk_left;
+    if( dir_left )
+      enc_cntr_bk_left--;
+    else
+      enc_cntr_bk_left++;
+  }
+  if( pin_fr_right != last_fr_right )
+  {
+    last_fr_right = pin_fr_right;
+    if( dir_right )
+      enc_cntr_fr_right--;
+    else
+      enc_cntr_fr_right++;
+  }
+  if( pin_bk_right != last_bk_right )
+  {
+    last_bk_right = pin_bk_right;
+    if( dir_right )
+      enc_cntr_bk_right--;
+    else
+      enc_cntr_bk_right++;
+  }
+}
+
 
 
