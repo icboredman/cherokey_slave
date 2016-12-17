@@ -5,7 +5,15 @@
  * 
  * boredman@boredomprojects.net
  * 
+ * rev 3.4 - 2016.12.17
+ *    - ODOM message publishing working
+ *    - nav_msgs::Odometry is to large,
+ *      increasing buffer size in ros.h does not help,
+ *      thereofore using geometry_msgs::InertiaStamped instead.
+ *      Must implement translation service on Raspberry side.
+ *      
  * rev 3.3 - 2016.12.11
+ *    - TF transform broadcast working
  *    - position calculation using optical wheel encoders
  *    - orientation calculation using IMU data
  * 
@@ -64,6 +72,8 @@
 #include <sensor_msgs/BatteryState.h>
 #include <tf/tf.h>
 #include <tf/transform_broadcaster.h>
+//#include <nav_msgs/Odometry.h>
+#include <geometry_msgs/InertiaStamped.h>
 
 using namespace sensor_msgs;
 
@@ -125,10 +135,10 @@ void callback_cmd_vel(const geometry_msgs::Twist& cmd_vel)
 
 ros::NodeHandle nh;
 
-ros::Subscriber<geometry_msgs::Twist> sub_vel("cherokey/cmd_vel", &callback_cmd_vel );
+ros::Subscriber<geometry_msgs::Twist> sub_vel("cmd_vel", &callback_cmd_vel );
 
 BatteryState bat_msg;
-ros::Publisher pub_bat("cherokey/battery", &bat_msg);
+ros::Publisher pub_bat("battery", &bat_msg);
 
 // motors & encoders
 int16_t pwm_right, pwm_left;
@@ -139,8 +149,11 @@ volatile unsigned long enc_cntr_bk_left, enc_cntr_bk_right;
 // odometry
 geometry_msgs::TransformStamped odom_tf;
 tf::TransformBroadcaster odom_broadcaster;
-char base_link[] = "/base_link";
-char odom[] = "/odom";
+//nav_msgs::Odometry odom;
+geometry_msgs::InertiaStamped odom;
+ros::Publisher pub_odom("odomTemp", &odom);
+char base_link_str[] = "base_link";
+char odom_str[] = "odom";
 
 
 #define ADC_SAMPLERATE_DELAY_MS (1000)
@@ -204,6 +217,7 @@ void setup()
   nh.initNode();
 
   nh.advertise(pub_bat);
+  nh.advertise(pub_odom);
   nh.subscribe(sub_vel);
 
   odom_broadcaster.init(nh);
@@ -329,8 +343,12 @@ void loop()
     double dif_left  = (dif_fr_left + dif_bk_left) / 2.0;
     double dif_right = (dif_fr_right + dif_bk_right) / 2.0;
 
-    double dx = 0;
+    //double dx = 0;
     double dy = (dif_left + dif_right) / 2.0 * PI * WHEEL_DIAM_M / ENCODER_STEPS;
+
+    static double last_theta;
+    double dth = theta - last_theta;
+    last_theta = theta;
 
     static double x, y;
     
@@ -347,8 +365,8 @@ void loop()
 
     //first, we'll publish the transform over tf
     odom_tf.header.stamp = current_time;
-    odom_tf.header.frame_id = odom;
-    odom_tf.child_frame_id = base_link;
+    odom_tf.header.frame_id = odom_str;
+    odom_tf.child_frame_id = base_link_str;
   
     odom_tf.transform.translation.x = x;
     odom_tf.transform.translation.y = y;
@@ -357,6 +375,43 @@ void loop()
 
     //send the transform
     odom_broadcaster.sendTransform(odom_tf);
+
+    //next, we'll publish the odometry message
+    odom.header.stamp = current_time;
+    //odom.header.frame_id = odom_str;
+
+    //double vx = dx / dt;
+    double vy = dy / dt;
+    double vth = dth / dt;
+
+//    odom.pose.pose.position.x = x;
+//    odom.pose.pose.position.y = y;
+//    odom.pose.pose.position.z = 0.0;
+//    odom.pose.pose.orientation = Quat;
+//
+//    odom.child_frame_id = base_link_str;
+//    odom.twist.twist.linear.x = 0.0;
+//    odom.twist.twist.linear.y = vy;
+//    odom.twist.twist.angular.z = vth;
+
+    odom.inertia.m = 0.0;
+    odom.inertia.com.x = x;
+    odom.inertia.com.y = y;
+    odom.inertia.com.z = 0.0;
+    odom.inertia.ixx = vy;
+    odom.inertia.ixy = vth;
+    odom.inertia.ixz = Quat.x;
+    odom.inertia.iyy = Quat.y;
+    odom.inertia.iyz = Quat.z;
+    odom.inertia.izz = Quat.w;
+
+//    odom.quaternion.x = x;
+//    odom.quaternion.y = y;
+//    odom.quaternion.z = vy;
+//    odom.quaternion.w = vth;
+
+    // publish the message
+    pub_odom.publish(&odom);
 
     nh.spinOnce();
   }
