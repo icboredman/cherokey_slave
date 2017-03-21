@@ -307,18 +307,18 @@ void loop()
 
 //    // get linear acceleration in "base_link" frame
 //    imu::Vector<3> accel = bno.getVector(Adafruit_BNO055::VECTOR_LINEARACCEL);
-//    static double ay;
-//    ay = accel.y();
-//    //vx += accel.x() * dt;
-//    vx = 0.0;
+//    static double ax;
+//    ax = accel.x();
+//    //vy += accel.y() * dt;
+//    vy = 0.0;
 //    if( pwm_speed == 0 )
-//      vy = 0;
+//      vx = 0;
 //    else
-//      vy += ay * dt;
+//      vx += ax * dt;
 //
 //    // calculate position while translating to "odom" frame
-//    x += (vx * cos(theta) - vy * sin(theta)) * dt;
-//    y += (vx * sin(theta) + vy * cos(theta)) * dt;
+//    x += (vy * sin(theta) + vx * cos(theta)) * dt;
+//    y += (vy * cos(theta) - vx * sin(theta)) * dt;
 
     noInterrupts();
     long cntr_fr_left  = (long)enc_cntr_fr_left;
@@ -343,8 +343,8 @@ void loop()
     double dif_left  = (dif_fr_left + dif_bk_left) / 2.0;
     double dif_right = (dif_fr_right + dif_bk_right) / 2.0;
 
-    //double dx = 0;
-    double dy = (dif_left + dif_right) / 2.0 * PI * WHEEL_DIAM_M / ENCODER_STEPS;
+    double dx = (dif_left + dif_right) / 2.0 * PI * WHEEL_DIAM_M / ENCODER_STEPS;
+    //double dy = 0;
 
     static double last_theta;
     double dth = theta - last_theta;
@@ -353,15 +353,18 @@ void loop()
     static double x, y;
     
     // calculate position while translating to "odom" frame
-    x -= dy * sin(theta);
-    y += dy * cos(theta);
+    x += dx * cos(theta);
+    y += dx * sin(theta);
 
+    /*
     // convert imu::Quaternion into geometry_msgs::Quaternion
     geometry_msgs::Quaternion Quat = geometry_msgs::Quaternion();
     Quat.x = quat.x();
     Quat.y = quat.y();
     Quat.z = quat.z();
     Quat.w = quat.w();
+    */
+    geometry_msgs::Quaternion Quat = tf::createQuaternionFromYaw(theta);
 
     //first, we'll publish the transform over tf
     odom_tf.header.stamp = current_time;
@@ -380,8 +383,8 @@ void loop()
     odom.header.stamp = current_time;
     //odom.header.frame_id = odom_str;
 
-    //double vx = dx / dt;
-    double vy = dy / dt;
+    double vx = dx / dt;
+    //double vy = dy / dt;
     double vth = dth / dt;
 
 //    odom.pose.pose.position.x = x;
@@ -390,15 +393,15 @@ void loop()
 //    odom.pose.pose.orientation = Quat;
 //
 //    odom.child_frame_id = base_link_str;
-//    odom.twist.twist.linear.x = 0.0;
-//    odom.twist.twist.linear.y = vy;
+//    odom.twist.twist.linear.x = vx;
+//    odom.twist.twist.linear.y = 0.0;
 //    odom.twist.twist.angular.z = vth;
 
     odom.inertia.m = 0.0;
     odom.inertia.com.x = x;
     odom.inertia.com.y = y;
     odom.inertia.com.z = 0.0;
-    odom.inertia.ixx = vy;
+    odom.inertia.ixx = vx;
     odom.inertia.ixy = vth;
     odom.inertia.ixz = Quat.x;
     odom.inertia.iyy = Quat.y;
@@ -407,7 +410,7 @@ void loop()
 
 //    odom.quaternion.x = x;
 //    odom.quaternion.y = y;
-//    odom.quaternion.z = vy;
+//    odom.quaternion.z = vx;
 //    odom.quaternion.w = vth;
 
     // publish the message
