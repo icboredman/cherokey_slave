@@ -5,6 +5,9 @@
  * 
  * boredman@boredomprojects.net
  * 
+ * rev 3.5 - 2017.03.22
+ *    - implemented proportional motor control loop
+ *
  * rev 3.4 - 2016.12.17
  *    - ODOM message publishing working
  *    - nav_msgs::Odometry is to large,
@@ -118,19 +121,16 @@ IntervalTimer encoderTimer;
 #define WHEEL_DIAM_M   0.063
 #define ENCODER_STEPS  40
 
-// velocity vector in units of [pwm counts]
-int pwm_speed = 0;
-int pwm_turn = 0;
-
-bool got_new_vel = false;
+// velocity vector in real units
+double cmd_vel_linear_x = 0.0;
+double cmd_vel_angular_z = 0.0;
+double vel_x = 0.0;
+double vel_th = 0.0;
 
 void callback_cmd_vel(const geometry_msgs::Twist& cmd_vel)
 {
-  // top_speed in m/s corresponds to pwm count of 255
-  pwm_speed = (int)(cmd_vel.linear.x * 255 / TOP_SPEED_M_S);
-  // 1 rad/s at stand still corresponds to +/-(distance between wheels / 2)
-  pwm_turn  = (int)(cmd_vel.angular.z * TURN_RADIUS_M * 255 / TOP_SPEED_M_S);
-  got_new_vel = true;
+  cmd_vel_linear_x = cmd_vel.linear.x;
+  cmd_vel_angular_z = cmd_vel.angular.z;
 }
 
 ros::NodeHandle nh;
@@ -164,7 +164,7 @@ ADC::Sync_result adcRes;
 // IMU sensor interface (I2C bus)
 // https://forums.adafruit.com/viewtopic.php?f=19&t=92153
 #define IMU_SENSOR_ID (55)
-#define IMU_SAMPLERATE_DELAY_MS (100)
+#define IMU_SAMPLERATE_DELAY_MS (50)
 Adafruit_BNO055 bno = Adafruit_BNO055(WIRE_BUS, IMU_SENSOR_ID, BNO055_ADDRESS_A, 
                                       I2C_MASTER, I2C_PINS_18_19, I2C_PULLUP_INT, 
                                       I2C_RATE_1000, I2C_OP_MODE_ISR);
@@ -343,12 +343,13 @@ void loop()
     double dif_left  = (dif_fr_left + dif_bk_left) / 2.0;
     double dif_right = (dif_fr_right + dif_bk_right) / 2.0;
 
-    double dx = (dif_left + dif_right) / 2.0 * PI * WHEEL_DIAM_M / ENCODER_STEPS;
+    double dx = (dif_right + dif_left) / 2.0 * PI * WHEEL_DIAM_M / ENCODER_STEPS;
     //double dy = 0;
 
-    static double last_theta;
-    double dth = theta - last_theta;
-    last_theta = theta;
+    double dth = (dif_right - dif_left) * PI * WHEEL_DIAM_M / ENCODER_STEPS;
+//    static double last_theta;
+//    double dth = theta - last_theta;
+//    last_theta = theta;
 
     static double x, y;
     
@@ -383,9 +384,9 @@ void loop()
     odom.header.stamp = current_time;
     //odom.header.frame_id = odom_str;
 
-    double vx = dx / dt;
-    //double vy = dy / dt;
-    double vth = dth / dt;
+    vel_x = dx / dt;
+  //vel_y = dy / dt;
+    vel_th = dth / dt;
 
 //    odom.pose.pose.position.x = x;
 //    odom.pose.pose.position.y = y;
@@ -393,16 +394,16 @@ void loop()
 //    odom.pose.pose.orientation = Quat;
 //
 //    odom.child_frame_id = base_link_str;
-//    odom.twist.twist.linear.x = vx;
+//    odom.twist.twist.linear.x = vel_x;
 //    odom.twist.twist.linear.y = 0.0;
-//    odom.twist.twist.angular.z = vth;
+//    odom.twist.twist.angular.z = vel_th;
 
     odom.inertia.m = 0.0;
     odom.inertia.com.x = x;
     odom.inertia.com.y = y;
     odom.inertia.com.z = 0.0;
-    odom.inertia.ixx = vx;
-    odom.inertia.ixy = vth;
+    odom.inertia.ixx = vel_x;
+    odom.inertia.ixy = vel_th;
     odom.inertia.ixz = Quat.x;
     odom.inertia.iyy = Quat.y;
     odom.inertia.iyz = Quat.z;
@@ -410,8 +411,11 @@ void loop()
 
 //    odom.quaternion.x = x;
 //    odom.quaternion.y = y;
-//    odom.quaternion.z = vx;
-//    odom.quaternion.w = vth;
+//    odom.quaternion.z = vel_x;
+//    odom.quaternion.w = vel_th;
+
+    // motor control loop
+    UpdateDrive();
 
     // publish the message
     pub_odom.publish(&odom);
@@ -446,29 +450,37 @@ void loop()
     bat_msg.percentage = BatteryPercentage(bat_msg.voltage);
 
     pub_bat.publish(&bat_msg);
-  }
 
-  nh.spinOnce();
-
-  if( got_new_vel )
-  {
-    UpdateDrive();
-    got_new_vel = false;
+    nh.spinOnce();
   }
 
   UpdateLED(bat_msg.percentage);
+  nh.spinOnce();
 }
 
 
 
+#define pwm_min 1
+#define cntr_loop_rate 50.0
 /*******************************************************
  * UpdateDrive()
  *   uses global variables pwm_speed and pwm_turn
  *   to calculate and set PWM values that drive motors.
  *******************************************************/
-#define pwm_min 10
 void UpdateDrive(void)
 {
+  static int pwm_speed, pwm_turn;
+
+  if( cmd_vel_linear_x == 0.0 )
+    pwm_speed = 0;
+  else
+    pwm_speed += cntr_loop_rate * (cmd_vel_linear_x - vel_x);
+
+  if( cmd_vel_angular_z == 0.0 )
+    pwm_turn = 0;
+  else
+    pwm_turn += cntr_loop_rate * (cmd_vel_angular_z - vel_th);
+
   pwm_right = pwm_speed + pwm_turn;
   if( pwm_right < 0 )
   {
