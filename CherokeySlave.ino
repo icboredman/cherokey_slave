@@ -59,7 +59,6 @@
  *    - initial version
  * ---------------------------------------------------
  */
-#include <i2c_t3.h>
 #include <Adafruit_BNO055_t3.h>
 #include <EEPROM.h>
 
@@ -71,12 +70,13 @@
 
 #define USE_TEENSY_HW_SERIAL
 #include <ros.h>
-#include <geometry_msgs/Twist.h>
-#include <sensor_msgs/BatteryState.h>
-#include <tf/tf.h>
-#include <tf/transform_broadcaster.h>
-//#include <nav_msgs/Odometry.h>
-#include <geometry_msgs/InertiaStamped.h>
+#include <sensor_msgs/BatteryState.h>  // for POWER_SUPPLY_STATUS_ constants
+
+#include "base_serial.h"
+
+// instance of serial driver
+Base_Serial uart(Serial1);
+
 
 using namespace sensor_msgs;
 
@@ -115,30 +115,17 @@ IntervalTimer encoderTimer;
 
 // linear speed in [m/s] corresponding to max pwm
 #define TOP_SPEED_M_S  0.7
-// half the distance between wheels in [m]
-#define TURN_RADIUS_M  0.072
 
-#define WHEEL_DIAM_M   0.063
+// distance between wheels in [m]
+#define WHEEL_BASE_M   0.144
+#define WHEEL_DIAM_MM  63.0
 #define ENCODER_STEPS  40
 
 // velocity vector in real units
 double cmd_vel_linear_x = 0.0;
 double cmd_vel_angular_z = 0.0;
-double vel_x = 0.0;
-double vel_th = 0.0;
-
-void callback_cmd_vel(const geometry_msgs::Twist& cmd_vel)
-{
-  cmd_vel_linear_x = cmd_vel.linear.x;
-  cmd_vel_angular_z = cmd_vel.angular.z;
-}
-
-ros::NodeHandle nh;
-
-ros::Subscriber<geometry_msgs::Twist> sub_vel("cmd_vel", &callback_cmd_vel );
-
-BatteryState bat_msg;
-ros::Publisher pub_bat("battery", &bat_msg);
+double vx_m_s = 0.0;
+double vth_rad_s = 0.0;
 
 // motors & encoders
 int16_t pwm_right, pwm_left;
@@ -146,20 +133,9 @@ bool dir_right, dir_left;
 volatile unsigned long enc_cntr_fr_left, enc_cntr_fr_right;
 volatile unsigned long enc_cntr_bk_left, enc_cntr_bk_right;
 
-// odometry
-geometry_msgs::TransformStamped odom_tf;
-tf::TransformBroadcaster odom_broadcaster;
-//nav_msgs::Odometry odom;
-geometry_msgs::InertiaStamped odom;
-ros::Publisher pub_odom("odomTemp", &odom);
-char base_link_str[] = "base_link";
-char odom_str[] = "odom";
-
-
 #define ADC_SAMPLERATE_DELAY_MS (1000)
 ADC *adc = new ADC(); // adc object
 ADC::Sync_result adcRes;
-
 
 // IMU sensor interface (I2C bus)
 // https://forums.adafruit.com/viewtopic.php?f=19&t=92153
@@ -209,25 +185,13 @@ void setup()
   adc->setSamplingSpeed(ADC_VERY_LOW_SPEED, ADC_1);
   adc->startSynchronizedContinuous(anlgPin_IBat, anlgPin_VBat);
 
-  // populate some constant values
-  bat_msg.design_capacity = 2500.0;
-  bat_msg.power_supply_technology = BatteryState::POWER_SUPPLY_TECHNOLOGY_NIMH;
-  bat_msg.present = true;
-
-  nh.initNode();
-
-  nh.advertise(pub_bat);
-  nh.advertise(pub_odom);
-  nh.subscribe(sub_vel);
-
-  odom_broadcaster.init(nh);
-
   // Initialise IMU sensor
   if( ! bno.begin() )
   {
-    nh.logerror("[TNSY] no IMU detected -> STOP");
-    while(1)
-      nh.spinOnce();
+//    nh.logerror("[TNSY] no IMU detected -> STOP");
+//    while(1)
+//      nh.spinOnce();
+    while(1) ;
   }
 
   int eeAddress = 0;
@@ -237,9 +201,10 @@ void setup()
 
   if( imuID != IMU_SENSOR_ID )
   {
-    nh.logerror("[TNSY] no IMU calibration data in EEPROM -> STOP");
-    while(1)
-      nh.spinOnce();
+//    nh.logerror("[TNSY] no IMU calibration data in EEPROM -> STOP");
+//    while(1)
+//      nh.spinOnce();
+    while(1) ;
   }
 
   adafruit_bno055_offsets_t calibrationData;
@@ -250,20 +215,20 @@ void setup()
 
   uint8_t system_status, self_test_results, system_error;
   bno.getSystemStatus(&system_status, &self_test_results, &system_error);
-  sprintf(str,"[TNSY] IMU status:%d self-test:%d error:%d",system_status,self_test_results,system_error);
-  nh.loginfo(str);
+//  sprintf(str,"[TNSY] IMU status:%d self-test:%d error:%d",system_status,self_test_results,system_error);
+//  nh.loginfo(str);
   
   bno.setExtCrystalUse(true);
 
-  nh.loginfo("[TNSY] move IMU slightly to calibrate magnetometers");
+//  nh.loginfo("[TNSY] move IMU slightly to calibrate magnetometers");
 
   uint8_t system, gyro, accel, mag;
   do {
-    nh.spinOnce();
+//    nh.spinOnce();
     digitalWrite(digPin_LED, HIGH);
     bno.getCalibration(&system, &gyro, &accel, &mag);
-    sprintf(str,"[TNSY] S:%d G:%d A:%d M:%d",system,gyro,accel,mag);
-    nh.loginfo(str);
+//    sprintf(str,"[TNSY] S:%d G:%d A:%d M:%d",system,gyro,accel,mag);
+//    nh.loginfo(str);
     delay(450);
     digitalWrite(digPin_LED, LOW);
     delay(50);
@@ -279,9 +244,14 @@ void setup()
   // min encoder half-period at max speed (0.7m/s) is 7ms
   encoderTimer.begin(EncoderService, 1000);
 
-  nh.loginfo("[TNSY] Init done");
+//  nh.loginfo("[TNSY] Init done");
 
 //  Serial.begin(57600);
+
+  uart.serial().begin(115200);
+  if( ! uart.init() )
+    while(1);
+//  Serial.print("Starting...");
 }
 
 
@@ -293,13 +263,12 @@ void loop()
 {
   static unsigned long time_prev_adc, time_prev_imu;
   unsigned long time_now = millis();
+  static float bat_percentage;
 
   if( time_now - time_prev_imu > IMU_SAMPLERATE_DELAY_MS )
   {
-    double dt = (time_now - time_prev_imu) / 1000.0;
+    unsigned long dt_ms = (time_now - time_prev_imu);
     time_prev_imu = time_now;
-
-    ros::Time current_time = nh.now();
 
     imu::Quaternion quat = bno.getQuat();
     imu::Vector<3> euler = quat.toEuler();
@@ -343,84 +312,28 @@ void loop()
     double dif_left  = (dif_fr_left + dif_bk_left) / 2.0;
     double dif_right = (dif_fr_right + dif_bk_right) / 2.0;
 
-    double dx = (dif_right + dif_left) / 2.0 * PI * WHEEL_DIAM_M / ENCODER_STEPS;
-    //double dy = 0;
+    double dx_mm = (dif_right + dif_left) / 2.0 * PI * WHEEL_DIAM_MM / ENCODER_STEPS;
+//  double dth_mrad = (dif_right - dif_left) / WHEEL_BASE_M * PI * WHEEL_DIAM_MM / ENCODER_STEPS;
 
-    double dth = (dif_right - dif_left) * PI * WHEEL_DIAM_M / ENCODER_STEPS;
-//    static double last_theta;
-//    double dth = theta - last_theta;
-//    last_theta = theta;
+    static double last_theta;
+    double dth = theta - last_theta;
+    if( dth > PI )
+      dth = dth - 2*PI;
+    if( dth < -PI )
+      dth = dth + 2*PI;
+    last_theta = theta;
 
-    static double x, y;
-    
-    // calculate position while translating to "odom" frame
-    x += dx * cos(theta);
-    y += dx * sin(theta);
+    uart.odom.theta = theta;
+    uart.odom.dx_mm = dx_mm;
+    uart.odom.dth = dth;
+    uart.odom.dt_ms = dt_ms;
+    uart.sendOdom();
 
-    /*
-    // convert imu::Quaternion into geometry_msgs::Quaternion
-    geometry_msgs::Quaternion Quat = geometry_msgs::Quaternion();
-    Quat.x = quat.x();
-    Quat.y = quat.y();
-    Quat.z = quat.z();
-    Quat.w = quat.w();
-    */
-    geometry_msgs::Quaternion Quat = tf::createQuaternionFromYaw(theta);
-
-    //first, we'll publish the transform over tf
-    odom_tf.header.stamp = current_time;
-    odom_tf.header.frame_id = odom_str;
-    odom_tf.child_frame_id = base_link_str;
-  
-    odom_tf.transform.translation.x = x;
-    odom_tf.transform.translation.y = y;
-    odom_tf.transform.translation.z = 0.0;
-    odom_tf.transform.rotation = Quat;    // = tf::createQuaternionFromYaw(theta);
-
-    //send the transform
-    odom_broadcaster.sendTransform(odom_tf);
-
-    //next, we'll publish the odometry message
-    odom.header.stamp = current_time;
-    //odom.header.frame_id = odom_str;
-
-    vel_x = dx / dt;
-  //vel_y = dy / dt;
-    vel_th = dth / dt;
-
-//    odom.pose.pose.position.x = x;
-//    odom.pose.pose.position.y = y;
-//    odom.pose.pose.position.z = 0.0;
-//    odom.pose.pose.orientation = Quat;
-//
-//    odom.child_frame_id = base_link_str;
-//    odom.twist.twist.linear.x = vel_x;
-//    odom.twist.twist.linear.y = 0.0;
-//    odom.twist.twist.angular.z = vel_th;
-
-    odom.inertia.m = 0.0;
-    odom.inertia.com.x = x;
-    odom.inertia.com.y = y;
-    odom.inertia.com.z = 0.0;
-    odom.inertia.ixx = vel_x;
-    odom.inertia.ixy = vel_th;
-    odom.inertia.ixz = Quat.x;
-    odom.inertia.iyy = Quat.y;
-    odom.inertia.iyz = Quat.z;
-    odom.inertia.izz = Quat.w;
-
-//    odom.quaternion.x = x;
-//    odom.quaternion.y = y;
-//    odom.quaternion.z = vel_x;
-//    odom.quaternion.w = vel_th;
+    vx_m_s = dx_mm / dt_ms;
+    vth_rad_s = dth * 1000.0 / dt_ms;
 
     // motor control loop
     UpdateDrive();
-
-    // publish the message
-    pub_odom.publish(&odom);
-
-    nh.spinOnce();
   }
 
 
@@ -443,19 +356,24 @@ void loop()
     // restart continuous V-I measurements
     adc->startSynchronizedContinuous(anlgPin_IBat, anlgPin_VBat);
 
-    bat_msg.current = (fI * VCC / 0.22) / adc->getMaxValue(ADC_0);
-    bat_msg.voltage = (fV * VCC) / adc->getMaxValue(ADC_1);
-    bat_msg.charge = (fVS * VCC) / adc->getMaxValue(ADC_0); // use for VS
-    bat_msg.power_supply_status = ChargingState();
-    bat_msg.percentage = BatteryPercentage(bat_msg.voltage);
-
-    pub_bat.publish(&bat_msg);
-
-    nh.spinOnce();
+    // scale results into milli(binary)-volts or -amperes
+    // so, no need to divide by ADC resolution (i.e. 1023)
+    uart.power.battery_miA = (int16_t)(fI * VCC / 0.22);
+    uart.power.battery_miV = (uint16_t)(fV * VCC);
+    uart.power.vsupply_miV = (uint16_t)(fVS * VCC); // use for VS
+    uart.power.charger_state = ChargingState();
+    bat_percentage = BatteryPercentage(fV * VCC / adc->getMaxValue(ADC_1));
+    uart.power.bat_percentage = (uint8_t)(bat_percentage * 100);
+    uart.sendPower();
   }
 
-  UpdateLED(bat_msg.percentage);
-  nh.spinOnce();
+  if( uart.recvDrive() )
+  {
+    cmd_vel_linear_x = (double)uart.drive.speed_mm_s / 1000.0;
+    cmd_vel_angular_z = (double)uart.drive.turn_mrad_s / 1000.0;
+  }
+
+  UpdateLED(bat_percentage);
 }
 
 
@@ -474,12 +392,12 @@ void UpdateDrive(void)
   if( cmd_vel_linear_x == 0.0 )
     pwm_speed = 0;
   else
-    pwm_speed += cntr_loop_rate * (cmd_vel_linear_x - vel_x);
+    pwm_speed += cntr_loop_rate * (cmd_vel_linear_x - vx_m_s);
 
   if( cmd_vel_angular_z == 0.0 )
     pwm_turn = 0;
   else
-    pwm_turn += cntr_loop_rate * (cmd_vel_angular_z - vel_th);
+    pwm_turn += cntr_loop_rate * (cmd_vel_angular_z - vth_rad_s);
 
   pwm_right = pwm_speed + pwm_turn;
   if( pwm_right < 0 )
@@ -566,8 +484,8 @@ void UpdateLED(float percentage)
  *  calculates charging state based on voltage at 
  *  dual-color LED of Graupner 6425 charger.
  *  uses analog comparator of Teensy
- * returns: 
- *   a constant as defined by BatteryState::POWER_SUPPLY_STATUS_...
+ * returns:
+ *   a constant as defined in sensor_msgs::BatteryState
  *******************************************************/
 uint8_t ChargingState()
 {
