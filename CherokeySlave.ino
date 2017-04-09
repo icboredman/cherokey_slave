@@ -5,6 +5,9 @@
  * 
  * boredman@boredomprojects.net
  * 
+ * rev 3.6 - 2017.04.09
+ *    - replaced rosserial with MessageSerial
+ *
  * rev 3.5 - 2017.03.22
  *    - implemented proportional motor control loop
  *
@@ -68,17 +71,48 @@
 // Teensy ADC library
 #include "ADC.h"
 
-#define USE_TEENSY_HW_SERIAL
-#include <ros.h>
-#include <sensor_msgs/BatteryState.h>  // for POWER_SUPPLY_STATUS_ constants
-
-#include "base_serial.h"
+#include <MessageSerial.h>
 
 // instance of serial driver
-Base_Serial uart(Serial1);
+MessageSerial serial(Serial1);
+
+// define actual messages and create corresponding Message objects
+typedef struct Power {
+  uint16_t battery_miV;
+  int16_t  battery_miA;
+  uint16_t vsupply_miV;
+  uint8_t  charger_state;
+  uint8_t  bat_percentage;
+} tPower;
+// Message objects should reference the above MessageSerial
+Message<tPower,2> power(serial);
+
+typedef struct {
+  float theta;
+  float dx_mm;
+  float dth;
+  uint16_t dt_ms;
+} tOdom;
+Message<tOdom,5> odom(serial);
+
+typedef struct {
+  int16_t speed_mm_s;
+  int16_t turn_mrad_s;
+} tDrive;
+Message<tDrive,7> drive(serial);
+
+typedef struct {
+  char str[100];
+} tStr;
+Message<tStr,1> text(serial); // message id 1 is reserved for character string messages
 
 
-using namespace sensor_msgs;
+//copied here from sensor_msgs/BatteryState.h
+enum { POWER_SUPPLY_STATUS_UNKNOWN =  0 };
+enum { POWER_SUPPLY_STATUS_CHARGING =  1 };
+enum { POWER_SUPPLY_STATUS_DISCHARGING =  2 };
+enum { POWER_SUPPLY_STATUS_NOT_CHARGING =  3 };
+enum { POWER_SUPPLY_STATUS_FULL =  4 };
 
 const int digPin_LED = 13;
 const int digPin_SHD = 6;
@@ -145,13 +179,15 @@ Adafruit_BNO055 bno = Adafruit_BNO055(WIRE_BUS, IMU_SENSOR_ID, BNO055_ADDRESS_A,
                                       I2C_MASTER, I2C_PINS_18_19, I2C_PULLUP_INT, 
                                       I2C_RATE_1000, I2C_OP_MODE_ISR);
 
-char str[100];
 
 /*******************************************************
  * SETUP function runs once on power-up or reset
  *******************************************************/
 void setup() 
 {
+  // initialize hardware serial port to be used with MessageSerial
+  Serial1.begin(115200);
+
   pinMode(digPin_LED, OUTPUT);
   digitalWrite(digPin_LED, LOW);
 
@@ -177,20 +213,19 @@ void setup()
   // configure ADC for V, I and VS measurements
   adc->setAveraging(32);
   adc->setResolution(10);
-  adc->setConversionSpeed(ADC_VERY_LOW_SPEED);
-  adc->setSamplingSpeed(ADC_VERY_LOW_SPEED);
+  adc->setConversionSpeed(ADC_CONVERSION_SPEED::VERY_LOW_SPEED);
+  adc->setSamplingSpeed(ADC_SAMPLING_SPEED::VERY_LOW_SPEED);
   adc->setAveraging(32, ADC_1);
   adc->setResolution(10, ADC_1);
-  adc->setConversionSpeed(ADC_VERY_LOW_SPEED, ADC_1);
-  adc->setSamplingSpeed(ADC_VERY_LOW_SPEED, ADC_1);
+  adc->setConversionSpeed(ADC_CONVERSION_SPEED::VERY_LOW_SPEED, ADC_1);
+  adc->setSamplingSpeed(ADC_SAMPLING_SPEED::VERY_LOW_SPEED, ADC_1);
   adc->startSynchronizedContinuous(anlgPin_IBat, anlgPin_VBat);
 
   // Initialise IMU sensor
   if( ! bno.begin() )
   {
-//    nh.logerror("[TNSY] no IMU detected -> STOP");
-//    while(1)
-//      nh.spinOnce();
+    strncpy(text.data.str, "[TNSY] no IMU detected -> STOP", sizeof(text.data.str));
+    text.send();
     while(1) ;
   }
 
@@ -201,9 +236,8 @@ void setup()
 
   if( imuID != IMU_SENSOR_ID )
   {
-//    nh.logerror("[TNSY] no IMU calibration data in EEPROM -> STOP");
-//    while(1)
-//      nh.spinOnce();
+    strncpy(text.data.str, "[TNSY] no IMU calibration data in EEPROM -> STOP", sizeof(text.data.str));
+    text.send();
     while(1) ;
   }
 
@@ -215,20 +249,24 @@ void setup()
 
   uint8_t system_status, self_test_results, system_error;
   bno.getSystemStatus(&system_status, &self_test_results, &system_error);
-//  sprintf(str,"[TNSY] IMU status:%d self-test:%d error:%d",system_status,self_test_results,system_error);
-//  nh.loginfo(str);
+  snprintf(text.data.str, sizeof(text.data.str),
+           "[TNSY] IMU status:%d self-test:%d error:%d",
+           system_status, self_test_results, system_error);
+  text.send();
   
   bno.setExtCrystalUse(true);
 
-//  nh.loginfo("[TNSY] move IMU slightly to calibrate magnetometers");
+  strncpy(text.data.str, "[TNSY] move IMU slightly to calibrate magnetometers", sizeof(text.data.str));
+  text.send();
 
   uint8_t system, gyro, accel, mag;
   do {
-//    nh.spinOnce();
     digitalWrite(digPin_LED, HIGH);
     bno.getCalibration(&system, &gyro, &accel, &mag);
-//    sprintf(str,"[TNSY] S:%d G:%d A:%d M:%d",system,gyro,accel,mag);
-//    nh.loginfo(str);
+    snprintf(text.data.str, sizeof(text.data.str),
+             "[TNSY] S:%d G:%d A:%d M:%d",
+             system, gyro, accel, mag);
+    text.send();
     delay(450);
     digitalWrite(digPin_LED, LOW);
     delay(50);
@@ -244,14 +282,10 @@ void setup()
   // min encoder half-period at max speed (0.7m/s) is 7ms
   encoderTimer.begin(EncoderService, 1000);
 
-//  nh.loginfo("[TNSY] Init done");
+  strncpy(text.data.str, "[TNSY] Init done", sizeof(text.data.str));
+  text.send();
 
-//  Serial.begin(57600);
-
-  uart.serial().begin(115200);
-  if( ! uart.init() )
-    while(1);
-//  Serial.print("Starting...");
+//  Serial.begin(57600); Serial.println("DEBUG");
 }
 
 
@@ -323,11 +357,11 @@ void loop()
       dth = dth + 2*PI;
     last_theta = theta;
 
-    uart.odom.theta = theta;
-    uart.odom.dx_mm = dx_mm;
-    uart.odom.dth = dth;
-    uart.odom.dt_ms = dt_ms;
-    uart.sendOdom();
+    odom.data.theta = theta;
+    odom.data.dx_mm = dx_mm;
+    odom.data.dth = dth;
+    odom.data.dt_ms = dt_ms;
+    odom.send();
 
     vx_m_s = dx_mm / dt_ms;
     vth_rad_s = dth * 1000.0 / dt_ms;
@@ -358,22 +392,25 @@ void loop()
 
     // scale results into milli(binary)-volts or -amperes
     // so, no need to divide by ADC resolution (i.e. 1023)
-    uart.power.battery_miA = (int16_t)(fI * VCC / 0.22);
-    uart.power.battery_miV = (uint16_t)(fV * VCC);
-    uart.power.vsupply_miV = (uint16_t)(fVS * VCC); // use for VS
-    uart.power.charger_state = ChargingState();
+    power.data.battery_miA = (int16_t)(fI * VCC / 0.22);
+    power.data.battery_miV = (uint16_t)(fV * VCC);
+    power.data.vsupply_miV = (uint16_t)(fVS * VCC); // use for VS
+    power.data.charger_state = ChargingState();
     bat_percentage = BatteryPercentage(fV * VCC / adc->getMaxValue(ADC_1));
-    uart.power.bat_percentage = (uint8_t)(bat_percentage * 100);
-    uart.sendPower();
+    power.data.bat_percentage = (uint8_t)(bat_percentage * 100);
+    power.send();
   }
 
-  if( uart.recvDrive() )
+  if( drive.available() )
   {
-    cmd_vel_linear_x = (double)uart.drive.speed_mm_s / 1000.0;
-    cmd_vel_angular_z = (double)uart.drive.turn_mrad_s / 1000.0;
+    cmd_vel_linear_x = (double)drive.data.speed_mm_s / 1000.0;
+    cmd_vel_angular_z = (double)drive.data.turn_mrad_s / 1000.0;
+    drive.ready();
   }
 
   UpdateLED(bat_percentage);
+
+  serial.update();
 }
 
 
@@ -500,18 +537,18 @@ uint8_t ChargingState()
     analogComparator.configureDac(thrd3);
     delay(10);
     if( analogComparator.getOutput() )
-      return BatteryState::POWER_SUPPLY_STATUS_FULL;
+      return POWER_SUPPLY_STATUS_FULL;
     else
-      return BatteryState::POWER_SUPPLY_STATUS_NOT_CHARGING;
+      return POWER_SUPPLY_STATUS_NOT_CHARGING;
   }
   else
   {
     analogComparator.configureDac(thrd1);
     delay(10);
     if( analogComparator.getOutput() )
-      return BatteryState::POWER_SUPPLY_STATUS_DISCHARGING;
+      return POWER_SUPPLY_STATUS_DISCHARGING;
     else
-      return BatteryState::POWER_SUPPLY_STATUS_CHARGING;
+      return POWER_SUPPLY_STATUS_CHARGING;
   }
 }
 
