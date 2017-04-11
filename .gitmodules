@@ -12,3 +12,6 @@
 	path = libraries/MessageSerial
 	url = https://github.com/icboredman/PacketSerial
 	branch = MessageSerial
+[submodule "libraries/Adafruit_BNO055"]
+	path = libraries/Adafruit_BNO055
+	url = https://github.com/adafruit/Adafruit_BNO055
