@@ -1,0 +1,14 @@
+[submodule "libraries/ADC"]
+	path = libraries/ADC
+	url = https://github.com/pedvide/ADC
+[submodule "libraries/analogComp"]
+	path = libraries/analogComp
+	url = https://github.com/icboredman/analogComp
+	branch = teensy3
+[submodule "libraries/FastCRC"]
+	path = libraries/FastCRC
+	url = https://github.com/FrankBoesing/FastCRC
+[submodule "libraries/MessageSerial"]
+	path = libraries/MessageSerial
+	url = https://github.com/icboredman/PacketSerial
+	branch = MessageSerial
