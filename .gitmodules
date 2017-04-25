@@ -15,3 +15,6 @@
 [submodule "libraries/Adafruit_BNO055"]
 	path = libraries/Adafruit_BNO055
 	url = https://github.com/adafruit/Adafruit_BNO055
+[submodule "libraries/Arduino-PID-Library"]
+	path = libraries/Arduino-PID-Library
+	url = https://github.com/br3ttb/Arduino-PID-Library

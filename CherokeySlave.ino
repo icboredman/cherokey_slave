@@ -66,10 +66,13 @@
 #include <EEPROM.h>
 
 // Teensy analog comparator library
-#include "analogComp.h"
+#include <analogComp.h>
 
 // Teensy ADC library
-#include "ADC.h"
+#include <ADC.h>
+
+// Arduino PID library
+#include <PID_v1.h>
 
 #include <MessageSerial.h>
 
@@ -89,7 +92,7 @@ Message<tPower,2> power(serial);
 
 typedef struct {
   float theta;
-  float dx_mm;
+  float dx;
   float dth;
   uint16_t dt_ms;
 } tOdom;
@@ -147,19 +150,42 @@ IntervalTimer encoderTimer;
 #define BAT_CELL_VMAX  1.4
 #define BAT_CELL_VMIN  0.9
 
-// linear speed in [m/s] corresponding to max pwm
+// linear speed [m/s] corresponding to max pwm
 #define TOP_SPEED_M_S  0.7
 
-// distance between wheels in [m]
+// distance between wheels [m]
 #define WHEEL_BASE_M   0.144
-#define WHEEL_DIAM_MM  63.0
+#define WHEEL_DIAM_M   0.063
 #define ENCODER_STEPS  40
 
-// velocity vector in real units
-double cmd_vel_linear_x = 0.0;
-double cmd_vel_angular_z = 0.0;
-double vx_m_s = 0.0;
-double vth_rad_s = 0.0;
+// use encoders rather than IMU to calculate dth
+//#define D_THETA_USE_ENCODERS
+
+// requested (setpoint) velocity vectors
+double cmd_speed = 0.0;
+double cmd_turn = 0.0;
+#define cmd_speed_min 0.01
+#define cmd_turn_min  0.01
+
+// measured (input) velocity vectors
+double vx = 0.0;
+double vth = 0.0;
+
+// pwm (output) velocity vectors
+double pwm_speed = 0.0;
+double pwm_turn = 0.0;
+
+// PID control constants
+double spdKp = 100;
+double spdKi = 2000;
+double spdKd = 0;
+double trnKp = 100;
+double trnKi = 2000;
+double trnKd = 0;
+
+// PID objects
+PID spdPID(&vx, &pwm_speed, &cmd_speed, spdKp, spdKi, spdKd, DIRECT);
+PID trnPID(&vth, &pwm_turn, &cmd_turn, trnKp, trnKi, trnKd, DIRECT);
 
 // motors & encoders
 int16_t pwm_right, pwm_left;
@@ -282,6 +308,14 @@ void setup()
   // min encoder half-period at max speed (0.7m/s) is 7ms
   encoderTimer.begin(EncoderService, 1000);
 
+  // PID sample time is slightly less than loop time, to ensure Compute() always executes
+  spdPID.SetSampleTime(IMU_SAMPLERATE_DELAY_MS-1);
+  spdPID.SetOutputLimits(-1000,1000);
+  spdPID.SetMode(AUTOMATIC);
+  trnPID.SetSampleTime(IMU_SAMPLERATE_DELAY_MS-1);
+  trnPID.SetOutputLimits(-1000,1000);
+  trnPID.SetMode(AUTOMATIC);
+
   strncpy(text.data.str, "[TNSY] Init done", sizeof(text.data.str));
   text.send();
 
@@ -346,9 +380,10 @@ void loop()
     double dif_left  = (dif_fr_left + dif_bk_left) / 2.0;
     double dif_right = (dif_fr_right + dif_bk_right) / 2.0;
 
-    double dx_mm = (dif_right + dif_left) / 2.0 * PI * WHEEL_DIAM_MM / ENCODER_STEPS;
-//  double dth_mrad = (dif_right - dif_left) / WHEEL_BASE_M * PI * WHEEL_DIAM_MM / ENCODER_STEPS;
-
+    double dx = (dif_right + dif_left) / 2.0 * PI * WHEEL_DIAM_M / ENCODER_STEPS;
+#ifdef D_THETA_USE_ENCODERS
+    double dth = (dif_right - dif_left) / WHEEL_BASE_M * PI * WHEEL_DIAM_M / ENCODER_STEPS;
+#else
     static double last_theta;
     double dth = theta - last_theta;
     if( dth > PI )
@@ -356,17 +391,21 @@ void loop()
     if( dth < -PI )
       dth = dth + 2*PI;
     last_theta = theta;
+#endif
 
     odom.data.theta = theta;
-    odom.data.dx_mm = dx_mm;
+    odom.data.dx = dx;
     odom.data.dth = dth;
     odom.data.dt_ms = dt_ms;
     odom.send();
 
-    vx_m_s = dx_mm / dt_ms;
-    vth_rad_s = dth * 1000.0 / dt_ms;
+    double dt = dt_ms / 1000.0;
+    vx  = dx / dt;
+    vth = dth / dt;
 
     // motor control loop
+    spdPID.Compute();
+    trnPID.Compute();
     UpdateDrive();
   }
 
@@ -403,8 +442,8 @@ void loop()
 
   if( drive.available() )
   {
-    cmd_vel_linear_x = (double)drive.data.speed_mm_s / 1000.0;
-    cmd_vel_angular_z = (double)drive.data.turn_mrad_s / 1000.0;
+    cmd_speed = (double)drive.data.speed_mm_s / 1000.0;
+    cmd_turn = (double)drive.data.turn_mrad_s / 1000.0;
     drive.ready();
   }
 
@@ -415,8 +454,6 @@ void loop()
 
 
 
-#define pwm_min 1
-#define cntr_loop_rate 50.0
 /*******************************************************
  * UpdateDrive()
  *   uses global variables pwm_speed and pwm_turn
@@ -424,17 +461,21 @@ void loop()
  *******************************************************/
 void UpdateDrive(void)
 {
-  static int pwm_speed, pwm_turn;
-
-  if( cmd_vel_linear_x == 0.0 )
+  if( cmd_speed > -cmd_speed_min && cmd_speed < cmd_speed_min )
+  {
+    spdPID.SetMode(MANUAL);
     pwm_speed = 0;
+  }
   else
-    pwm_speed += cntr_loop_rate * (cmd_vel_linear_x - vx_m_s);
+    spdPID.SetMode(AUTOMATIC);
 
-  if( cmd_vel_angular_z == 0.0 )
+  if( cmd_turn > -cmd_turn_min && cmd_turn < cmd_turn_min )
+  {
+    trnPID.SetMode(MANUAL);
     pwm_turn = 0;
+  }
   else
-    pwm_turn += cntr_loop_rate * (cmd_vel_angular_z - vth_rad_s);
+    trnPID.SetMode(AUTOMATIC);
 
   pwm_right = pwm_speed + pwm_turn;
   if( pwm_right < 0 )
@@ -445,8 +486,6 @@ void UpdateDrive(void)
   else if( pwm_right > 0 )
     dir_right = LOW;
 
-  if( pwm_right > 0 && pwm_right < pwm_min )
-    pwm_right = pwm_min;
   if( pwm_right > 255 )
     pwm_right = 255;
   
@@ -459,8 +498,6 @@ void UpdateDrive(void)
   else if( pwm_left > 0 )
     dir_left = LOW;
 
-  if( pwm_left > 0 && pwm_left < pwm_min )
-    pwm_left = pwm_min;
   if( pwm_left > 255 )
     pwm_left = 255;
 
