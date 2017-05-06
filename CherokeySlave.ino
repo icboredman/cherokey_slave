@@ -5,6 +5,12 @@
  * 
  * boredman@boredomprojects.net
  * 
+ * rev 3.8 - 2017.05.06
+ *    - battery charge state using coulomb counting
+ *
+ * rev 3.7 - 2017.04.25
+ *    - PID motor control
+ *
  * rev 3.6 - 2017.04.09
  *    - replaced rosserial with MessageSerial
  *
@@ -83,7 +89,7 @@ MessageSerial serial(Serial1);
 typedef struct Power {
   uint16_t battery_miV;
   int16_t  battery_miA;
-  uint16_t vsupply_miV;
+  uint16_t battery_mOhm;
   uint8_t  charger_state;
   uint8_t  bat_percentage;
 } tPower;
@@ -149,6 +155,7 @@ IntervalTimer encoderTimer;
 #define BAT_N_CELLS    6
 #define BAT_CELL_VMAX  1.4
 #define BAT_CELL_VMIN  0.9
+#define BAT_CAPACITY   2500.0
 
 // linear speed [m/s] corresponding to max pwm
 #define TOP_SPEED_M_S  0.7
@@ -195,7 +202,12 @@ volatile unsigned long enc_cntr_bk_left, enc_cntr_bk_right;
 
 #define ADC_SAMPLERATE_DELAY_MS (1000)
 ADC *adc = new ADC(); // adc object
-ADC::Sync_result adcRes;
+// variables used in ADC ISR
+volatile float adc_I_avg, adc_V_avg;
+volatile int32_t adc_I_min, adc_I_max;
+volatile int32_t adc_V_min, adc_V_max;
+volatile float adc_I_coulomb;
+volatile bool adc_reset_min_max;
 
 // IMU sensor interface (I2C bus)
 // https://forums.adafruit.com/viewtopic.php?f=19&t=92153
@@ -236,7 +248,7 @@ void setup()
   // configure analog comparator for battery charging state
   analogComparator.setOn(0, 7);   // 0 = compPin_Stat (pin 11),  7 = 6bit DAC (ref)
 
-  // configure ADC for V, I and VS measurements
+  // configure ADC for simultaneous V and I measurements
   adc->setAveraging(32);
   adc->setResolution(10);
   adc->setConversionSpeed(ADC_CONVERSION_SPEED::VERY_LOW_SPEED);
@@ -245,7 +257,12 @@ void setup()
   adc->setResolution(10, ADC_1);
   adc->setConversionSpeed(ADC_CONVERSION_SPEED::VERY_LOW_SPEED, ADC_1);
   adc->setSamplingSpeed(ADC_SAMPLING_SPEED::VERY_LOW_SPEED, ADC_1);
+  // the above settings will produce result every ~430 us (at 96MHz cpu)
+  // ISR for ADC_0 will also read result of ADC_1
+  adc->enableInterrupts(ADC_0);
+  adc_reset_min_max = true;
   adc->startSynchronizedContinuous(anlgPin_IBat, anlgPin_VBat);
+  adc_I_coulomb = 0.0;
 
   // Initialise IMU sensor
   if( ! bno.begin() )
@@ -319,7 +336,7 @@ void setup()
   strncpy(text.data.str, "[TNSY] Init done", sizeof(text.data.str));
   text.send();
 
-//  Serial.begin(57600); Serial.println("DEBUG");
+//Serial.begin(57600); Serial.println("DEBUG");
 }
 
 
@@ -414,28 +431,39 @@ void loop()
   {
     time_prev_adc = time_now;
 
-    // get results from most recent V-I measurements
-    adcRes = adc->readSynchronizedContinuous();
-
-    // negative voltage across current sensing resistor R11 (0.22 ohm)
-    // is measured with a resistor divider 100K/(100K||100K) to (VCC||GND)
-    float fI = (float)adcRes.result_adc0 * 3.0 - adc->getMaxValue(ADC_0);
-    // the above subtracted from voltage measurement to get true battery voltage,
-    // while factoring in its resistor divider (100K/50K)
-    float fV = (float)adcRes.result_adc1 * 3.0 - fI;
-
+    uint8_t charger_state = ChargingState();
+/*
     // interrupt continuous V-I and do one-shot VS measurement
     float fVS = analogRead(anlgPin_VS) * (39+39+4.7)/4.7;
     // restart continuous V-I measurements
     adc->startSynchronizedContinuous(anlgPin_IBat, anlgPin_VBat);
+*/
+    // calculate battery's internal resistance: R = (V1-V2)/(I1-I2)
+    // which could be used to estimate battery aging
+    noInterrupts();
+    int32_t di = adc_I_max - adc_I_min;
+    int32_t dv = adc_V_max - adc_V_min;
+    adc_reset_min_max = true;
+    interrupts();
+    float R = (float)dv / (float)di / 0.22 - 1.0;
+    static float R_avg;
+    // only update R_avg when there's significant difference in current
+    if( di > 5 )
+      R_avg = R_avg * 0.9 + R * 0.1;
 
-    // scale results into milli(binary)-volts or -amperes
+    // coulomb counting
+    if( charger_state == POWER_SUPPLY_STATUS_FULL )
+      adc_I_coulomb = 0.0;
+    // convert from [counts*us] to [miA*h]
+    float charge = adc_I_coulomb * VCC / 0.22 / (1e3 * ADC_SAMPLERATE_DELAY_MS * 3600);
+
+    // convert results into milli(binary)-volts or -amperes
     // so, no need to divide by ADC resolution (i.e. 1023)
-    power.data.battery_miA = (int16_t)(fI * VCC / 0.22);
-    power.data.battery_miV = (uint16_t)(fV * VCC);
-    power.data.vsupply_miV = (uint16_t)(fVS * VCC); // use for VS
-    power.data.charger_state = ChargingState();
-    bat_percentage = BatteryPercentage(fV * VCC / adc->getMaxValue(ADC_1));
+    power.data.battery_miA = (int16_t)(adc_I_avg * VCC / 0.22);
+    power.data.battery_miV = (uint16_t)(adc_V_avg * VCC);
+    power.data.battery_mOhm = (uint16_t)(R_avg * 1000);
+    power.data.charger_state = charger_state;
+    bat_percentage = BatteryPercentageC(charge);
     power.data.bat_percentage = (uint8_t)(bat_percentage * 100);
     power.send();
   }
@@ -510,12 +538,30 @@ void UpdateDrive(void)
 
 /*******************************************************
  * BatteryPercentage()
- *   calculates remaining battery charge 
+ *   calculates remaining battery charge based on Voltage
  *   as a value between 0.0 and 1.0
  *******************************************************/
-float BatteryPercentage(float vbat)
+float BatteryPercentageV(float vbat)
 {
   float percentage = (vbat/BAT_N_CELLS - BAT_CELL_VMIN) / (BAT_CELL_VMAX - BAT_CELL_VMIN);
+  if( percentage < 0.0 )
+    return 0.0;  
+  else if( percentage > 1.0 )
+    return 1.0;
+  else
+    return percentage;
+}
+
+
+/*******************************************************
+ * BatteryPercentage()
+ *   calculates remaining battery charge based on Coulomb counting
+ *   as a value between 0.0 and 1.0
+ * coulomb is a negative number!
+ *******************************************************/
+float BatteryPercentageC(float coulomb)
+{
+  float percentage = (BAT_CAPACITY - (-coulomb)) / BAT_CAPACITY;
   if( percentage < 0.0 )
     return 0.0;  
   else if( percentage > 1.0 )
@@ -634,4 +680,48 @@ static void EncoderService(void)
 }
 
 
+// ADC ISR runs every ~430 us (at 96MHz cpu speed)
+void adc0_isr()
+{
+  static unsigned long isr_last_start;
+  unsigned long isr_start = micros();
+
+  // get first result
+  int32_t result_I = adc->analogReadContinuous(ADC_0);
+  // wait for second result to complete
+  while( ! adc->isComplete(ADC_1) ) {}
+  // get second result
+  int32_t result_V = adc->analogReadContinuous(ADC_1);
+
+  // flag adc_reset_min_max is used as a signal to reset min and max calculations
+  if( result_I > adc_I_max || adc_reset_min_max )
+  {
+    adc_I_max = result_I;
+    adc_V_max = result_V;
+  }
+  if( result_I < adc_I_min || adc_reset_min_max )
+  {
+    adc_I_min = result_I;
+    adc_V_min = result_V;
+  }
+  if( adc_reset_min_max )
+    adc_reset_min_max = false;
+
+  // scale and shift results to convert to I and V (still in units of adc counts)
+  // negative voltage across current sensing resistor R11 (0.22 ohm)
+  // is measured with a resistor divider 100K/(100K||100K) to 1/2 VCC
+  float adc_I = (float)result_I * 3.0 - adc->getMaxValue(ADC_0);
+  // the above subtracted from voltage measurement to get true battery voltage,
+  // while factoring in its resistor divider (100K/50K)
+  float adc_V = (float)result_V * 3.0 - adc_I;
+
+  // running average calculations for I and V
+  adc_I_avg = adc_I_avg * 0.99 + adc_I * 0.01;
+  adc_V_avg = adc_V_avg * 0.99 + adc_V * 0.01;
+
+  // coulomb counting in units of [counts*us]
+  adc_I_coulomb += adc_I * (float)(isr_start - isr_last_start);
+
+  isr_last_start = isr_start;
+}
 
