@@ -5,6 +5,9 @@
  * 
  * boredman@boredomprojects.net
  * 
+ * rev 3.9 - 2019.02.18
+ *    - USB communication, without MessageSerial
+ * 
  * rev 3.8 - 2017.05.06
  *    - battery charge state using coulomb counting
  *
@@ -80,11 +83,6 @@
 // Arduino PID library
 #include <PID_v1.h>
 
-#include <MessageSerial.h>
-
-// instance of serial driver
-MessageSerial serial(Serial1);
-
 // define actual messages and create corresponding Message objects
 typedef struct Power {
   uint16_t battery_miV;
@@ -93,8 +91,6 @@ typedef struct Power {
   uint8_t  charger_state;
   uint8_t  bat_percentage;
 } tPower;
-// Message objects should reference the above MessageSerial
-Message<tPower,2> power(serial);
 
 typedef struct {
   float theta;
@@ -102,18 +98,16 @@ typedef struct {
   float dth;
   uint16_t dt_ms;
 } tOdom;
-Message<tOdom,5> odom(serial);
+
+typedef struct {
+  tPower power;
+  tOdom  odom;
+} tTxPacket;
 
 typedef struct {
   int16_t speed_mm_s;
   int16_t turn_mrad_s;
 } tDrive;
-Message<tDrive,7> drive(serial);
-
-typedef struct {
-  char str[100];
-} tStr;
-Message<tStr,1> text(serial); // message id 1 is reserved for character string messages
 
 
 //copied here from sensor_msgs/BatteryState.h
@@ -152,10 +146,10 @@ IntervalTimer encoderTimer;
 
 #define VCC (3.31f)
 
-#define BAT_N_CELLS    6
+#define BAT_N_CELLS    7
 #define BAT_CELL_VMAX  1.4
 #define BAT_CELL_VMIN  0.9
-#define BAT_CAPACITY   2500.0
+#define BAT_CAPACITY   (2850.0 * 1024/1000)   //in [miA*h]
 
 // linear speed [m/s] corresponding to max pwm
 #define TOP_SPEED_M_S  0.7
@@ -200,7 +194,7 @@ bool dir_right, dir_left;
 volatile unsigned long enc_cntr_fr_left, enc_cntr_fr_right;
 volatile unsigned long enc_cntr_bk_left, enc_cntr_bk_right;
 
-#define ADC_SAMPLERATE_DELAY_MS (1000)
+#define ADC_SAMPLERATE_DELAY_MS (250)
 ADC *adc = new ADC(); // adc object
 // variables used in ADC ISR
 volatile float adc_I_avg, adc_V_avg;
@@ -223,8 +217,8 @@ Adafruit_BNO055 bno = Adafruit_BNO055(WIRE_BUS, IMU_SENSOR_ID, BNO055_ADDRESS_A,
  *******************************************************/
 void setup() 
 {
-  // initialize hardware serial port to be used with MessageSerial
-  Serial1.begin(115200);
+  // initialize USB serial port
+  Serial.begin(115200);
 
   pinMode(digPin_LED, OUTPUT);
   digitalWrite(digPin_LED, LOW);
@@ -267,8 +261,8 @@ void setup()
   // Initialise IMU sensor
   if( ! bno.begin() )
   {
-    strncpy(text.data.str, "[TNSY] no IMU detected -> STOP", sizeof(text.data.str));
-    text.send();
+//    strncpy(text.data.str, "[TNSY] no IMU detected -> STOP", sizeof(text.data.str));
+//    text.send();
     while(1) ;
   }
 
@@ -279,8 +273,8 @@ void setup()
 
   if( imuID != IMU_SENSOR_ID )
   {
-    strncpy(text.data.str, "[TNSY] no IMU calibration data in EEPROM -> STOP", sizeof(text.data.str));
-    text.send();
+//    strncpy(text.data.str, "[TNSY] no IMU calibration data in EEPROM -> STOP", sizeof(text.data.str));
+//    text.send();
     while(1) ;
   }
 
@@ -292,24 +286,24 @@ void setup()
 
   uint8_t system_status, self_test_results, system_error;
   bno.getSystemStatus(&system_status, &self_test_results, &system_error);
-  snprintf(text.data.str, sizeof(text.data.str),
-           "[TNSY] IMU status:%d self-test:%d error:%d",
-           system_status, self_test_results, system_error);
-  text.send();
+//  snprintf(text.data.str, sizeof(text.data.str),
+//           "[TNSY] IMU status:%d self-test:%d error:%d",
+//           system_status, self_test_results, system_error);
+//  text.send();
   
   bno.setExtCrystalUse(true);
 
-  strncpy(text.data.str, "[TNSY] move IMU slightly to calibrate magnetometers", sizeof(text.data.str));
-  text.send();
+//  strncpy(text.data.str, "[TNSY] move IMU slightly to calibrate magnetometers", sizeof(text.data.str));
+//  text.send();
 
   uint8_t system, gyro, accel, mag;
   do {
     digitalWrite(digPin_LED, HIGH);
     bno.getCalibration(&system, &gyro, &accel, &mag);
-    snprintf(text.data.str, sizeof(text.data.str),
-             "[TNSY] S:%d G:%d A:%d M:%d",
-             system, gyro, accel, mag);
-    text.send();
+//    snprintf(text.data.str, sizeof(text.data.str),
+//             "[TNSY] S:%d G:%d A:%d M:%d",
+//             system, gyro, accel, mag);
+//    text.send();
     delay(450);
     digitalWrite(digPin_LED, LOW);
     delay(50);
@@ -333,10 +327,8 @@ void setup()
   trnPID.SetOutputLimits(-1000,1000);
   trnPID.SetMode(AUTOMATIC);
 
-  strncpy(text.data.str, "[TNSY] Init done", sizeof(text.data.str));
-  text.send();
-
-//Serial.begin(57600); Serial.println("DEBUG");
+//  strncpy(text.data.str, "[TNSY] Init done", sizeof(text.data.str));
+//  text.send();
 }
 
 
@@ -350,6 +342,9 @@ void loop()
   unsigned long time_now = millis();
   static float bat_percentage;
 
+  static tTxPacket txPacket;
+  static tDrive drive;
+  
   if( time_now - time_prev_imu > IMU_SAMPLERATE_DELAY_MS )
   {
     unsigned long dt_ms = (time_now - time_prev_imu);
@@ -410,11 +405,13 @@ void loop()
     last_theta = theta;
 #endif
 
-    odom.data.theta = theta;
-    odom.data.dx = dx;
-    odom.data.dth = dth;
-    odom.data.dt_ms = dt_ms;
-    odom.send();
+    txPacket.odom.theta = theta;
+    txPacket.odom.dx = dx;
+    txPacket.odom.dth = dth;
+    txPacket.odom.dt_ms = dt_ms;
+    //send both odom and power here:
+    Serial.write((uint8_t*)&txPacket, sizeof(tTxPacket));
+    Serial.send_now();
 
     double dt = dt_ms / 1000.0;
     vx  = dx / dt;
@@ -445,11 +442,13 @@ void loop()
     int32_t dv = adc_V_max - adc_V_min;
     adc_reset_min_max = true;
     interrupts();
-    float R = (float)dv / (float)di / 0.22 - 1.0;
     static float R_avg;
     // only update R_avg when there's significant difference in current
-    if( di > 5 )
+    if( di >= 4 )
+    {
+      float R = (float)dv / (float)di / 0.22 - 1.0;
       R_avg = R_avg * 0.9 + R * 0.1;
+    }
 
     // coulomb counting
     if( charger_state == POWER_SUPPLY_STATUS_FULL )
@@ -459,25 +458,33 @@ void loop()
 
     // convert results into milli(binary)-volts or -amperes
     // so, no need to divide by ADC resolution (i.e. 1023)
-    power.data.battery_miA = (int16_t)(adc_I_avg * VCC / 0.22);
-    power.data.battery_miV = (uint16_t)(adc_V_avg * VCC);
-    power.data.battery_mOhm = (uint16_t)(R_avg * 1000);
-    power.data.charger_state = charger_state;
+    txPacket.power.battery_miA = (int16_t)(adc_I_avg * VCC / 0.22);
+    txPacket.power.battery_miV = (uint16_t)(adc_V_avg * VCC);
+    txPacket.power.battery_mOhm = (uint16_t)(R_avg * 1000);
+    txPacket.power.charger_state = charger_state;
     bat_percentage = BatteryPercentageC(charge);
-    power.data.bat_percentage = (uint8_t)(bat_percentage * 100);
-    power.send();
+    txPacket.power.bat_percentage = (uint8_t)(bat_percentage * 100);
+    //power will be sent together with odom, which happens more often.
   }
 
-  if( drive.available() )
+
+  uint8_t *pdata = (uint8_t*)&drive;
+  uint8_t nbytes = 0;
+
+  while (Serial.available())
   {
-    cmd_speed = (double)drive.data.speed_mm_s / 1000.0;
-    cmd_turn = (double)drive.data.turn_mrad_s / 1000.0;
-    drive.ready();
+    *pdata++ = Serial.read();
+    if (++nbytes == sizeof(tDrive))
+    {
+//      cmd_speed = (double)drive.speed_mm_s / 1000.0;
+//      cmd_turn = (double)drive.turn_mrad_s / 1000.0;
+      break;
+    }
   }
+
 
   UpdateLED(bat_percentage);
 
-  serial.update();
 }
 
 
@@ -557,7 +564,7 @@ float BatteryPercentageV(float vbat)
  * BatteryPercentage()
  *   calculates remaining battery charge based on Coulomb counting
  *   as a value between 0.0 and 1.0
- * coulomb is a negative number!
+ * coulomb is a negative number when discharging, in units of [miA*h]
  *******************************************************/
 float BatteryPercentageC(float coulomb)
 {
@@ -613,6 +620,8 @@ uint8_t ChargingState()
   const int thrd2 = 15;   //0.8 V;
   const int thrd3 = 36;   //1.9 V;
 
+  uint8_t new_state;
+  
   analogComparator.configureDac(thrd2);
   delay(10);
   if( analogComparator.getOutput() )
@@ -620,19 +629,35 @@ uint8_t ChargingState()
     analogComparator.configureDac(thrd3);
     delay(10);
     if( analogComparator.getOutput() )
-      return POWER_SUPPLY_STATUS_FULL;
+      new_state = POWER_SUPPLY_STATUS_FULL;
     else
-      return POWER_SUPPLY_STATUS_NOT_CHARGING;
+      new_state = POWER_SUPPLY_STATUS_NOT_CHARGING;
   }
   else
   {
     analogComparator.configureDac(thrd1);
     delay(10);
     if( analogComparator.getOutput() )
-      return POWER_SUPPLY_STATUS_DISCHARGING;
+      new_state = POWER_SUPPLY_STATUS_DISCHARGING;
     else
-      return POWER_SUPPLY_STATUS_CHARGING;
+      new_state = POWER_SUPPLY_STATUS_CHARGING;
   }
+
+  // shift register to filter new_state:
+  static uint8_t accumulator[8]; // power of 2!
+  static uint8_t idx = 0;
+  static uint8_t last_state;
+  
+  accumulator[idx++] = new_state;
+  idx &= 7; // wrap around
+
+  for (int i=0; i<6; i++)
+  {
+    if (accumulator[i] != accumulator[i+1])
+      return last_state;
+  }
+  last_state = new_state;
+  return new_state;
 }
 
 
@@ -686,13 +711,18 @@ void adc0_isr()
   static unsigned long isr_last_start;
   unsigned long isr_start = micros();
 
+  ADC::Sync_result adc_result;
+  adc_result = adc->readSynchronizedContinuous();
+  int32_t result_I = adc_result.result_adc0;
+  int32_t result_V = adc_result.result_adc1;
+/*
   // get first result
   int32_t result_I = adc->analogReadContinuous(ADC_0);
   // wait for second result to complete
   while( ! adc->isComplete(ADC_1) ) {}
   // get second result
   int32_t result_V = adc->analogReadContinuous(ADC_1);
-
+*/
   // flag adc_reset_min_max is used as a signal to reset min and max calculations
   if( result_I > adc_I_max || adc_reset_min_max )
   {
@@ -724,4 +754,3 @@ void adc0_isr()
 
   isr_last_start = isr_start;
 }
-

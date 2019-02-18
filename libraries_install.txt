@@ -1,0 +1,16 @@
+
+
+git clone https://github.com/adafruit/Adafruit_Sensor.git 
+
+git clone https://github.com/orangkucing/analogComp.git
+
+git clone https://github.com/br3ttb/Arduino-PID-Library.git
+
+https://github.com/icboredman/PacketSerial.git
+mv PacketSerial MessageSerial
+
+git clone https://github.com/icboredman/analogComp.git
+
+git clone https://github.com/pedvide/ADC.git
+
+git clone https://github.com/FrankBoesing/FastCRC.git
