@@ -80,10 +80,11 @@
 // Arduino PID library
 #include <PID_v1.h>
 
+#define MSG_SERIAL_SKIP_CRC
 #include <MessageSerial.h>
 
 // instance of serial driver
-MessageSerial serial(Serial1);
+MessageSerial serial(Serial);
 
 // define actual messages and create corresponding Message objects
 typedef struct Power {
@@ -155,7 +156,7 @@ IntervalTimer encoderTimer;
 #define BAT_N_CELLS    6
 #define BAT_CELL_VMAX  1.4
 #define BAT_CELL_VMIN  0.9
-#define BAT_CAPACITY   2500.0
+#define BAT_CAPACITY   (2850.0 * 1024/1000) //in [miA*h]
 
 // linear speed [m/s] corresponding to max pwm
 #define TOP_SPEED_M_S  0.7
@@ -200,7 +201,7 @@ bool dir_right, dir_left;
 volatile unsigned long enc_cntr_fr_left, enc_cntr_fr_right;
 volatile unsigned long enc_cntr_bk_left, enc_cntr_bk_right;
 
-#define ADC_SAMPLERATE_DELAY_MS (1000)
+#define ADC_SAMPLERATE_DELAY_MS (250)
 ADC *adc = new ADC(); // adc object
 // variables used in ADC ISR
 volatile float adc_I_avg, adc_V_avg;
@@ -224,7 +225,7 @@ Adafruit_BNO055 bno = Adafruit_BNO055(WIRE_BUS, IMU_SENSOR_ID, BNO055_ADDRESS_A,
 void setup() 
 {
   // initialize hardware serial port to be used with MessageSerial
-  Serial1.begin(115200);
+  Serial.begin(115200);
 
   pinMode(digPin_LED, OUTPUT);
   digitalWrite(digPin_LED, LOW);
@@ -323,7 +324,7 @@ void setup()
 
   // periodic interrupt servicing wheel encoders
   // min encoder half-period at max speed (0.7m/s) is 7ms
-  encoderTimer.begin(EncoderService, 1000);
+  encoderTimer.begin(EncoderService, 1000); // every 1 ms
 
   // PID sample time is slightly less than loop time, to ensure Compute() always executes
   spdPID.SetSampleTime(IMU_SAMPLERATE_DELAY_MS-1);
@@ -448,8 +449,11 @@ void loop()
     float R = (float)dv / (float)di / 0.22 - 1.0;
     static float R_avg;
     // only update R_avg when there's significant difference in current
-    if( di > 5 )
+    if( di >= 4 )
+    {
+      float R = (float)dv / (float)di / 0.22 - 1.0;
       R_avg = R_avg * 0.9 + R * 0.1;
+    }
 
     // coulomb counting
     if( charger_state == POWER_SUPPLY_STATUS_FULL )
@@ -473,6 +477,8 @@ void loop()
     cmd_speed = (double)drive.data.speed_mm_s / 1000.0;
     cmd_turn = (double)drive.data.turn_mrad_s / 1000.0;
     drive.ready();
+strncpy(text.data.str, "[TNSY] Got cmd_vel", sizeof(text.data.str));
+text.send();
   }
 
   UpdateLED(bat_percentage);
@@ -557,7 +563,7 @@ float BatteryPercentageV(float vbat)
  * BatteryPercentage()
  *   calculates remaining battery charge based on Coulomb counting
  *   as a value between 0.0 and 1.0
- * coulomb is a negative number!
+ * coulomb is a negative number when discharging, in units of [miA*h]
  *******************************************************/
 float BatteryPercentageC(float coulomb)
 {
@@ -613,6 +619,8 @@ uint8_t ChargingState()
   const int thrd2 = 15;   //0.8 V;
   const int thrd3 = 36;   //1.9 V;
 
+  uint8_t new_state;
+  
   analogComparator.configureDac(thrd2);
   delay(10);
   if( analogComparator.getOutput() )
@@ -620,19 +628,35 @@ uint8_t ChargingState()
     analogComparator.configureDac(thrd3);
     delay(10);
     if( analogComparator.getOutput() )
-      return POWER_SUPPLY_STATUS_FULL;
+      new_state = POWER_SUPPLY_STATUS_FULL;
     else
-      return POWER_SUPPLY_STATUS_NOT_CHARGING;
+      new_state = POWER_SUPPLY_STATUS_NOT_CHARGING;
   }
   else
   {
     analogComparator.configureDac(thrd1);
     delay(10);
     if( analogComparator.getOutput() )
-      return POWER_SUPPLY_STATUS_DISCHARGING;
+      new_state = POWER_SUPPLY_STATUS_DISCHARGING;
     else
-      return POWER_SUPPLY_STATUS_CHARGING;
+      new_state = POWER_SUPPLY_STATUS_CHARGING;
   }
+
+  // shift register to filter new_state:
+  static uint8_t accumulator[8]; // power of 2!
+  static uint8_t idx = 0;
+  static uint8_t last_state;
+  
+  accumulator[idx++] = new_state;
+  idx &= 7; // wrap around
+
+  for (int i=0; i<6; i++)
+  {
+    if (accumulator[i] != accumulator[i+1])
+      return last_state;
+  }
+  last_state = new_state;
+  return new_state;
 }
 
 
@@ -686,12 +710,9 @@ void adc0_isr()
   static unsigned long isr_last_start;
   unsigned long isr_start = micros();
 
-  // get first result
-  int32_t result_I = adc->analogReadContinuous(ADC_0);
-  // wait for second result to complete
-  while( ! adc->isComplete(ADC_1) ) {}
-  // get second result
-  int32_t result_V = adc->analogReadContinuous(ADC_1);
+  ADC::Sync_result adc_result = adc->readSynchronizedContinuous();
+  int32_t result_I = adc_result.result_adc0;
+  int32_t result_V = adc_result.result_adc1;
 
   // flag adc_reset_min_max is used as a signal to reset min and max calculations
   if( result_I > adc_I_max || adc_reset_min_max )
@@ -724,4 +745,3 @@ void adc0_isr()
 
   isr_last_start = isr_start;
 }
-
