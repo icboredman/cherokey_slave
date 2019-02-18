@@ -5,6 +5,10 @@
  * 
  * boredman@boredomprojects.net
  * 
+ * rev 3.9 - 2019.02.18
+ *    - USB CDC communication
+ *    - minor improvements
+ * 
  * rev 3.8 - 2017.05.06
  *    - battery charge state using coulomb counting
  *
@@ -477,8 +481,6 @@ void loop()
     cmd_speed = (double)drive.data.speed_mm_s / 1000.0;
     cmd_turn = (double)drive.data.turn_mrad_s / 1000.0;
     drive.ready();
-strncpy(text.data.str, "[TNSY] Got cmd_vel", sizeof(text.data.str));
-text.send();
   }
 
   UpdateLED(bat_percentage);
