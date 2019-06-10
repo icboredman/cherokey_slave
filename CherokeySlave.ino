@@ -222,6 +222,9 @@ Adafruit_BNO055 bno = Adafruit_BNO055(WIRE_BUS, IMU_SENSOR_ID, BNO055_ADDRESS_A,
                                       I2C_MASTER, I2C_PINS_18_19, I2C_PULLUP_INT, 
                                       I2C_RATE_1000, I2C_OP_MODE_ISR);
 
+// timeout to stop motors after 10 sec of no commands received
+#define DRIVE_TIMEOUT_DELAY_MS (10000)
+
 
 /*******************************************************
  * SETUP function runs once on power-up or reset
@@ -351,7 +354,7 @@ void setup()
  *******************************************************/
 void loop() 
 {
-  static unsigned long time_prev_adc, time_prev_imu;
+  static unsigned long time_prev_adc, time_prev_imu, time_last_drive;
   unsigned long time_now = millis();
   static float bat_percentage;
 
@@ -450,7 +453,6 @@ void loop()
     int32_t dv = adc_V_max - adc_V_min;
     adc_reset_min_max = true;
     interrupts();
-    float R = (float)dv / (float)di / 0.22 - 1.0;
     static float R_avg;
     // only update R_avg when there's significant difference in current
     if( di >= 4 )
@@ -478,9 +480,16 @@ void loop()
 
   if( drive.available() )
   {
+    time_last_drive = time_now;
     cmd_speed = (double)drive.data.speed_mm_s / 1000.0;
     cmd_turn = (double)drive.data.turn_mrad_s / 1000.0;
     drive.ready();
+  }
+  else if( time_now - time_last_drive > DRIVE_TIMEOUT_DELAY_MS )
+  {
+    time_last_drive = time_now;
+    cmd_speed = 0.0;
+    cmd_turn = 0.0;
   }
 
   UpdateLED(bat_percentage);
