@@ -197,7 +197,7 @@ double trnKd = 0;
 
 // PID objects
 PID spdPID(&vx, &pwm_speed, &cmd_speed, spdKp, spdKi, spdKd, P_ON_M, DIRECT);
-PID trnPID(&vth, &pwm_turn, &cmd_turn, trnKp, trnKi, trnKd, P_ON_M, DIRECT);
+PID trnPID(&vth, &pwm_turn, &cmd_turn, trnKp, trnKi, trnKd, DIRECT);
 
 // motors & encoders
 int16_t pwm_right, pwm_left;
