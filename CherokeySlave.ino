@@ -5,71 +5,6 @@
  * 
  * boredman@boredomprojects.net
  * 
- * rev 3.9 - 2019.02.18
- *    - USB CDC communication
- *    - minor improvements
- * 
- * rev 3.8 - 2017.05.06
- *    - battery charge state using coulomb counting
- *
- * rev 3.7 - 2017.04.25
- *    - PID motor control
- *
- * rev 3.6 - 2017.04.09
- *    - replaced rosserial with MessageSerial
- *
- * rev 3.5 - 2017.03.22
- *    - implemented proportional motor control loop
- *
- * rev 3.4 - 2016.12.17
- *    - ODOM message publishing working
- *    - nav_msgs::Odometry is to large,
- *      increasing buffer size in ros.h does not help,
- *      thereofore using geometry_msgs::InertiaStamped instead.
- *      Must implement translation service on Raspberry side.
- *      
- * rev 3.3 - 2016.12.11
- *    - TF transform broadcast working
- *    - position calculation using optical wheel encoders
- *    - orientation calculation using IMU data
- * 
- * rev 3.2 - 2016.10.31
- *    - implemented interface to BNO055 IMU sensor
- *    - added /tf orientation transform broadcasting
- * 
- * rev 3.1 - 2016.10.16
- *    - using analogComp library for battery charging status measurements
- *        Teensy support from: https://github.com/orangkucing/analogComp
- *        added comparator polling from: https://github.com/rlagerweij/analogComp
- *        added 6-bit dac as reference
- *    - using ADC library from: https://github.com/pedvide/ADC
- *        background synchronous V-I measurements
- *        hardware averaging
- *      
- * rev 3.0 - 2016.10.10
- *    - use Teensy3.2 instead of Pro Mini
- *    - modified hardware and software for VCC=3.3V
- *    * inaccurate ADC measurements -> should change sampling speed
- * 
- * rev 2.3 - 2016.07.16
- *    - put back LED battery indicator
- *
- * rev 2.2 - 2016.07.16
- *    - adapted for use with ROS through 'rosserial' package
- *    - implemented messages:
- *        geometry_msgs/Twist (cmd_vel)
- *        sensor_msgs/BatteryState
- *    
- * rev 2.1 - 2016.07.11
- *    - implemented packet-based uart communication
- *      using RH_Serial driver from RadioHead:
- *      http://www.airspayce.com/mikem/arduino/RadioHead/classRH__Serial.html
- *    
- * rev 2.0 - 2016.07.10
- *    - communication over UART (instead of I2C)
- *    
- * rev 1.0 - 2016.05.18
- *    - initial version
  * ---------------------------------------------------
  */
 #include <Adafruit_BNO055_t3.h>
@@ -157,7 +92,7 @@ IntervalTimer encoderTimer;
 
 #define VCC (3.31f)
 
-#define BAT_N_CELLS    6
+#define BAT_N_CELLS    7
 #define BAT_CELL_VMAX  1.4
 #define BAT_CELL_VMIN  0.9
 #define BAT_CAPACITY   (2850.0 * 1024/1000) //in [miA*h]
@@ -357,6 +292,8 @@ void loop()
   static unsigned long time_prev_adc, time_prev_imu, time_last_drive;
   unsigned long time_now = millis();
   static float bat_percentage;
+  static bool charger_connect_sig = false;
+  static bool charger_connect_ack = false;
 
   if( time_now - time_prev_imu > IMU_SAMPLERATE_DELAY_MS )
   {
@@ -440,12 +377,29 @@ void loop()
     time_prev_adc = time_now;
 
     uint8_t charger_state = ChargingState();
-/*
+
     // interrupt continuous V-I and do one-shot VS measurement
-    float fVS = analogRead(anlgPin_VS) * (39+39+4.7)/4.7;
-    // restart continuous V-I measurements
+    adc->stopSynchronizedContinuous();
+    float adc_VS = analogRead(anlgPin_VS) * (39+39+4.7)/4.7;
+    adc->enableInterrupts(ADC_0);
     adc->startSynchronizedContinuous(anlgPin_IBat, anlgPin_VBat);
-*/
+    //snprintf(text.data.str, sizeof(text.data.str), "[TNSY] VS=%f", adc_VS*VCC/1023);
+    //text.send();
+    if( adc_VS > 3900 )  // ~ 12.6 V
+    {
+      if( charger_connect_ack == false )
+      {
+        charger_connect_sig = true;
+        cmd_speed = 0.0;
+        cmd_turn = 0.0;
+      }
+    }
+    else
+    {
+      charger_connect_ack = false;
+      charger_connect_sig = false;
+    }
+
     // calculate battery's internal resistance: R = (V1-V2)/(I1-I2)
     // which could be used to estimate battery aging
     noInterrupts();
@@ -483,6 +437,16 @@ void loop()
     time_last_drive = time_now;
     cmd_speed = (double)drive.data.speed_mm_s / 1000.0;
     cmd_turn = (double)drive.data.turn_mrad_s / 1000.0;
+    if( charger_connect_sig == true )
+    {
+      if( charger_connect_ack == false || drive.data.speed_mm_s >= 0 )
+      {
+        cmd_speed = 0.0;
+        cmd_turn = 0.0;
+      }
+      if( drive.data.speed_mm_s == 0 && drive.data.turn_mrad_s == 0 )
+        charger_connect_ack = true;
+    }
     drive.ready();
   }
   else if( time_now - time_last_drive > DRIVE_TIMEOUT_DELAY_MS )
